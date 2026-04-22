@@ -1,0 +1,70 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer buff_vert_ground {
+    vec4 position[];
+};
+
+layout(r32f, set = 0, binding = 1) uniform readonly image2D img_terrain;
+
+layout(set = 0, binding = 2) uniform Cfg {
+    float ground_size;
+};
+
+vec3 terrain_pos(ivec2 uv, float h, vec2 cells)
+{
+    vec2 t = vec2(uv) / cells;   // note: divide by (size - 1)
+    return vec3(
+        2.0 * ground_size * (t.x - 0.5),
+        h,
+        2.0 * ground_size * (t.y - 0.5)
+    );
+}
+
+void main()
+{
+    uvec2 gid = gl_GlobalInvocationID.xy;
+
+    ivec2 size_i = imageSize(img_terrain);
+    uvec2 size = uvec2(size_i);
+    uvec2 cells = size - 1u;
+
+    if (gid.x >= cells.x || gid.y >= cells.y)
+        return;
+
+    // Quad vertices:
+    //
+    // v0 ---- v1
+    // |      / |
+    // |    /   |
+    // |  /     |
+    // v2 ---- v3
+    //
+
+    ivec2 iuv0 = ivec2(gid);
+    ivec2 iuv1 = iuv0 + ivec2(1, 0);
+    ivec2 iuv2 = iuv0 + ivec2(0, 1);
+    ivec2 iuv3 = iuv0 + ivec2(1, 1);
+
+    float h0 = imageLoad(img_terrain, iuv0).x;
+    float h1 = imageLoad(img_terrain, iuv1).x;
+    float h2 = imageLoad(img_terrain, iuv2).x;
+    float h3 = imageLoad(img_terrain, iuv3).x;
+
+    vec2 cells_f = vec2(cells);
+
+    vec3 p0 = terrain_pos(iuv0, h0, cells_f);
+    vec3 p1 = terrain_pos(iuv1, h1, cells_f);
+    vec3 p2 = terrain_pos(iuv2, h2, cells_f);
+    vec3 p3 = terrain_pos(iuv3, h3, cells_f);
+
+    uint base = (gid.y * cells.x + gid.x) * 6u;
+
+    position[base + 0u] = vec4(p0, 1.0);
+    position[base + 1u] = vec4(p2, 1.0);
+    position[base + 2u] = vec4(p1, 1.0);
+    position[base + 3u] = vec4(p1, 1.0);
+    position[base + 4u] = vec4(p2, 1.0);
+    position[base + 5u] = vec4(p3, 1.0);
+}

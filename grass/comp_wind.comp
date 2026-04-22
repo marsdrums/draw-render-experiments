@@ -1,0 +1,95 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "c74.noise.funcs.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rg32f, binding = 0) uniform writeonly image2D img_perlin;
+
+layout(binding = 1) uniform Cfg {
+    float time;
+    float scale;
+    float amt;
+};
+
+float noiseField(vec2 p, float zoff) {
+    return pnoise(vec3(p, zoff + time * 0.005), vec3(100.0));
+}
+
+vec2 stretchAlongDir(vec2 p, vec2 dir, float stretch) {
+    dir = normalize(dir);
+    vec2 side = vec2(-dir.y, dir.x);
+
+    float a = dot(p, dir);
+    float b = dot(p, side);
+
+    a /= stretch; // stretch features along dir in image/world space
+    return dir * a + side * b;
+}
+
+vec2 makeDomain(vec2 uv, vec2 scrollDir, float scrollSpeed, float stretchAmount) {
+    vec2 p = uv * scale + scrollDir * (time * scrollSpeed);
+
+    // stretch the field along the scrolling direction
+    p = stretchAlongDir(p, scrollDir, stretchAmount);
+
+    return p;
+}
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(img_perlin);
+    if (gid.x >= size.x || gid.y >= size.y) return;
+
+    float scrollSpeed = length(vec2(0.06, 0.04));
+    vec2 scrollDir = vec2(0.06, 0.04) / scrollSpeed;
+    float stretchAmount = 2.0; // >1 = more elongated along scrollDir
+    vec2 uv = vec2(gid) / vec2(size);
+    vec2 du = vec2(1.0 / float(size.x), 0.0);
+    vec2 dv = vec2(0.0, 1.0 / float(size.y));
+    vec2 flow = vec2(0.0);
+    float lamt = 1.0;
+
+    vec2 luv = uv;
+    vec2 ldu = du;
+    vec2 ldv = dv;
+
+    for(int i = 1; i <= 4; i++){
+
+         // finite-difference step in uv space
+        vec2 pL = makeDomain(luv - ldu, scrollDir, scrollSpeed, stretchAmount);
+        vec2 pR = makeDomain(luv + ldu, scrollDir, scrollSpeed, stretchAmount);
+        vec2 pD = makeDomain(luv - ldv, scrollDir, scrollSpeed, stretchAmount);
+        vec2 pU = makeDomain(luv + ldv, scrollDir, scrollSpeed, stretchAmount);
+
+        float nL = noiseField(pL, 11.0);
+        float nR = noiseField(pR, 11.0);
+        float nD = noiseField(pD, 29.0);
+        float nU = noiseField(pU, 29.0);
+
+        vec2 grad = vec2(nR - nL, nU - nD);
+        flow += vec2(grad.y, -grad.x)*lamt;   
+
+        luv *= 2;  
+        ldu *= 2;
+        ldv *= 2;
+        lamt *= 0.5;  
+    }
+
+    float mag = clamp(length(flow) * 6.0, 0.0, 1.0);
+    if (mag > 1e-5) {
+        flow = normalize(flow) * mag;
+    }
+
+    //float allignment = dot(flow/mag, scrollDir)*0.5 + 0.5;
+    //float allignment = max(0.0, dot(flow/mag, -scrollDir));
+    //allignment *= allignment;
+    //flow *= allignment;
+    flow *= amt;
+    // prevailing breeze
+    flow += -scrollDir * 0.035;
+    flow = clamp(flow, vec2(-1.0), vec2(1.0));
+
+
+    imageStore(img_perlin, gid, vec4(flow, 0.0, 1.0));
+}

@@ -1,0 +1,19 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer buff_indirect { 
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance; 
+};
+
+layout(binding = 1) uniform Cfg{
+    uint num_vertices;
+};
+
+
+void main() {
+    vertexCount = instanceCount * num_vertices;
+}

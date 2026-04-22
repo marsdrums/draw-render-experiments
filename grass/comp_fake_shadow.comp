@@ -1,0 +1,24 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "c74.noise.funcs.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(r32f, binding = 0) uniform writeonly image2D img_fake_shadow;
+layout(binding = 1) uniform Cfg{
+    float scale;
+    float amt;
+    float time;
+};
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(img_fake_shadow);
+    if (gid.x >= size.x || gid.y >= size.y) return;
+
+    vec2 uv = vec2(gid) / vec2(size);
+
+    float val = pnoise(vec3(uv*scale, time), vec3(100.0)) * amt;
+
+    imageStore(img_fake_shadow, gid, vec4(val));
+}

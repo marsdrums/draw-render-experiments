@@ -1,0 +1,247 @@
+#version 460
+
+#pragma stage(vertex)
+
+struct Instance {
+    mat4 model;
+    mat4 norm;
+    // legacy per-instance params from the repo:
+    // x = k1, y = k2, z = lambda, w = drag
+    vec4 bend;
+};
+
+layout(set = 0, binding = 0) uniform Constants {
+    mat4 mvp;
+    vec3 eye;
+    vec3 ligDir;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer buff_grass_instanceinfo {
+    Instance instances[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer buff_visible_indices {
+    uint visibleIndices[];
+};
+
+// RG = world-space wind vector on the ground plane.
+layout(binding = 3) uniform sampler2D img_perlin;
+layout(binding = 4) uniform sampler2D img_cloud;
+
+layout(location = 0) in vec3 pos;
+layout(location = 1) in vec2 uv;
+layout(location = 2) in vec3 nor;
+
+layout(location = 0) out vec3 outPos;
+layout(location = 1) out float inShadow;
+layout(location = 2) out vec3 albedo;
+layout(location = 3) out float bendAmount;
+layout(location = 4) out float seed;
+layout(location = 5) out vec3 outNor;
+layout(location = 6) out vec3 outWpos;
+
+const float PI = 3.14159265358979323846;
+const float GROUND_HALF_SIZE = 100.0;
+const float BLADE_HEIGHT = 1.0; // max Y of grass_blade.jxf
+const float MAX_BEND_ANGLE = 1.0 * PI; // a quarter circle
+const float WIND_TO_ANGLE = 1.0;
+
+vec2 safeNormalize2(vec2 v, vec2 fallback) {
+    float len = length(v);
+    return (len > 1e-6) ? (v / len) : fallback;
+}
+
+vec3 rotateInBendFrame(vec3 v, vec3 D, vec3 S, vec3 U, float phi)
+{
+    float vS = dot(v, S);
+    float vD = dot(v, D);
+    float vU = dot(v, U);
+
+    float c = cos(phi);
+    float s = sin(phi);
+
+    return vS * S
+         + (vD * c + vU * s) * D
+         + (-vD * s + vU * c) * U;
+}
+
+void main() {
+    uint srcIndex = visibleIndices[gl_InstanceIndex];
+    Instance inst = instances[srcIndex];
+    seed = float(srcIndex)*PI;
+
+    // Sample one shared wind vector per blade, using the blade origin in world-space.
+    vec3 bladeOriginWS = inst.model[3].xyz;
+    vec2 uv = (bladeOriginWS.xz + GROUND_HALF_SIZE) / (2.0 * GROUND_HALF_SIZE);
+    uv = fract(uv);
+    uv += (fract(bladeOriginWS.xz*PI)*2 - 1)*0.002;
+
+    vec2 randUV = vec2(float(srcIndex % 400), float(srcIndex)/400.0);
+    randUV = mod(randUV, vec2(400.0));
+    randUV /= 400; 
+
+    float windIntensity = smoothstep(0.0, 1.0, (texture(img_perlin, uv).x*0.5 + 0.5)*2.5 - 0.8);
+    vec2 w0 = windIntensity * normalize(vec2(-0.04, 0.06));
+    //vec2 w1 = texture(img_perlin, fract(uv * 2.0 + vec2(0.37, 0.61))).xy * 0.5;
+    //vec2 w2 = texture(img_perlin, fract(uv * 4.0 + vec2(0.11, 0.83))).xy * 0.25;
+
+    float scalingY = inst.model[1].y;
+    vec2 turbulence = sin(texture(img_perlin, randUV).xy*PI*6 / scalingY) * 0.1;//(0.02 + clamp(1 - length(w0),0,1)*0.02); //turbulence
+    vec2 windField = (w0 + turbulence);// * inst.bend.w;
+
+    // World-space ground-plane wind.
+    vec3 worldWind = vec3(windField.x, 0.0, -windField.y);
+
+    // Instance-local horizontal basis expressed in world-space.
+    vec3 bladeRightWS = inst.model[0].xyz;
+    vec3 bladeForwardWS = inst.model[2].xyz;
+
+    // Convert the world wind to the blade's local XZ plane.
+    vec2 localWindXZ = vec2(
+        dot(worldWind, bladeRightWS),
+        dot(worldWind, bladeForwardWS)
+    );
+
+    float windMag = length(localWindXZ);
+    bendAmount = windMag;
+
+    // Bend plane follows the wind direction immediately, 100%.
+    // If wind magnitude is extremely small, fall back to the authored forward direction.
+    vec2 bendDir2 = safeNormalize2(localWindXZ, vec2(0.0, 1.0));
+    vec2 sideDir2 = vec2(bendDir2.y, -bendDir2.x); // cross(up, bendDir)
+
+    vec3 D = vec3(bendDir2.x, 0.0, bendDir2.y); // local bend direction on the ground plane
+    vec3 S = vec3(sideDir2.x, 0.0, sideDir2.y); // axis perpendicular to the bend plane
+    vec3 U = vec3(0.0, 1.0, 0.0);
+
+    float y = clamp(pos.y, 0.0, BLADE_HEIGHT);
+    float s = y / BLADE_HEIGHT;
+
+    // Reuse the existing per-instance parameters as artist controls:
+    // - k2 gives a small resting bend amount
+    // - lambda reduces wind sensitivity (stiffer blade)
+    // - drag scales the sampled wind already
+    float restTheta = 0.0;//inst.bend.y * 2.0;
+    float windTheta = windMag * WIND_TO_ANGLE;// * mix(1.15, 0.45, clamp(inst.bend.z, 0.0, 1.0));
+    float theta = clamp(restTheta + windTheta, 0.0, MAX_BEND_ANGLE);
+
+    vec3 pFinal;
+
+    if (theta < 1e-5) {
+        pFinal = pos;
+    } else {
+        // Circular-arc model.
+        // The undeformed blade length is preserved by treating the original height y as arc length.
+        // Arc length = R * theta  =>  R = H / theta
+        float R = BLADE_HEIGHT / theta;
+        float phi = theta * s;
+
+        vec3 bentNormalLocal = rotateInBendFrame(nor, D, S, U, phi);
+        //mat3 normalModel = transpose(inverse(mat3(inst.model)));
+        outNor = normalize(mat3(inst.norm) * bentNormalLocal);
+
+        float sinPhi = sin(phi);
+        float cosPhi = cos(phi);
+
+        // Decompose the authored blade shape into the bend-plane basis.
+        float sideOffset = dot(pos.xz, sideDir2);
+        float foreOffset = dot(pos.xz, bendDir2);
+
+        // Centerline of the blade after rolling over a circular arc.
+        vec3 centerline = D * (R * (1.0 - cosPhi)) + U * (R * sinPhi);
+
+        // Rotate the local cross-section by the same local angle phi around the side axis.
+        vec3 rotatedForwardOffset = foreOffset * (D * cosPhi - U * sinPhi);
+        vec3 preservedSideOffset = sideOffset * S;
+
+        pFinal = centerline + rotatedForwardOffset + preservedSideOffset;
+    }
+
+    vec4 wPos = inst.model * vec4(pFinal, 1.0);
+    outPos = pFinal;
+    outWpos = wPos.xyz;
+    gl_Position = mvp * wPos;
+
+    float fid = float(srcIndex);
+    vec3 colorJitter = sin(fid * vec3(1.0, 2.0, 3.0) + vec3(8.0, 9.0, 10.0)) * 0.5 + 0.5;
+    float bendAmt = clamp(theta / MAX_BEND_ANGLE, 0.0, 1.0);
+
+    albedo = mix(vec3(0.023, 0.08, 0.02) * 0.1, vec3(0.27, 0.4, 0.1), clamp(s*s, 0.0, 1.0));
+    albedo.rg += colorJitter.rg * 0.05;
+    albedo = mix(albedo, albedo * 0.3, bendAmt * 0.30);
+    albedo.rgb *= 0.4;
+    inShadow = texture(img_cloud, uv).x;
+}
+
+#pragma stage(fragment)
+
+layout(set = 0, binding = 0) uniform Constants {
+    mat4 mvp;
+    vec3 eye;
+    vec3 ligDir;
+};
+
+layout(binding = 5) uniform sampler2D img_fake_shadow;
+
+layout(location = 0) in vec3 outPos;
+layout(location = 1) in float inShadow;
+layout(location = 2) in vec3 albedo;
+layout(location = 3) in float bendAmount;
+layout(location = 4) in float seed;
+layout(location = 5) in vec3 outNor;
+layout(location = 6) in vec3 outWpos;
+
+layout(location = 0) out vec4 fragColor;
+
+float fresnel(float NoV){
+
+    float x = 1.0 - NoV;
+    float x2 = x * x;
+    x2 *= x2;
+    return x2*x*0.99 + 0.01;
+}
+
+void main() {
+
+    float h4 = outPos.y * outPos.y;
+    h4 *= h4;
+    vec2 fakeShadowUV;
+    fakeShadowUV.x = fract(seed + (1 - h4) + outPos.y*0.7);
+    fakeShadowUV.y = fract(outPos.x*0.2 + bendAmount*0.4);
+    float fakeShadow = clamp(texture(img_fake_shadow, fakeShadowUV*0.5).x, 0.0, 1.0)*0.5 + 0.02;
+
+    fakeShadow = h4 > fakeShadow ? 1.0 : 0.2;
+
+    vec3 N = -normalize(outNor);
+
+    if(!gl_FrontFacing) N *= -1.0;
+
+    float diff = dot(N, ligDir)*0.5 + 0.5; //"Half-life" style diffuse
+
+    vec3 V = normalize(outWpos - eye);
+    vec3 R = reflect(V, N);
+    float NoV = max(0.0, dot(N, V));
+    float spe = max(0.0, dot(R, ligDir));
+    spe *= spe;
+    spe *= spe;
+    spe *= spe;
+    spe *= spe;
+    spe *= spe;
+    spe *= spe; 
+    spe *= spe; // ^128
+
+    float F = fresnel(NoV);
+
+    vec3 lightCol = vec3(4.0, 3.5, 3.0)*2;
+    vec3 ambient = vec3(1.0, 1.0, 2.0);
+
+    float finalShadow = inShadow * fakeShadow; //combine clouds and grass blades masking
+    vec3 diffuse = lightCol * diff * finalShadow;
+    vec3 specular = spe * lightCol * F * finalShadow; //i'm using shadow as a reflections occlusion factor
+
+    fragColor.rgb = albedo * (diffuse + ambient) + specular; //composite
+
+    //fragColor.rgb = specular;
+    fragColor.a = 1.0;
+
+}

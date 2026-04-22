@@ -1,0 +1,80 @@
+// compare the grass blades AABBs and check if they're inside the view frustum
+#version 460
+
+layout(local_size_x = 256) in;
+
+struct Instance {
+    mat4 model;
+    mat4 norm;
+    // legacy per-instance params from the repo:
+    // x = k1, y = k2, z = lambda, w = drag
+    vec4 bend;
+};
+
+layout(std430, set = 0, binding = 0) buffer readonly buff_grass_instanceinfo {
+    Instance instances[];
+};
+
+layout(std430, set = 0, binding = 1) buffer writeonly buff_inside {
+    uint inside[];
+};
+
+layout(std140, set = 0, binding = 2) uniform Cfg {
+    vec3 Npos;
+    vec3 Fpos;
+    vec3 Rpos;
+    vec3 Lpos;
+    vec3 Tpos;
+    vec3 Bpos;
+
+    vec3 Ndir;
+    vec3 Fdir;
+    vec3 Rdir;
+    vec3 Ldir;
+    vec3 Tdir;
+    vec3 Bdir;
+
+    vec3 modelMin;
+    vec3 modelMax;
+    vec3 bendPaddingLocal;
+
+    uint numOfInstances;
+};
+
+bool aabbOutsidePlane(vec3 center, vec3 extents, vec3 planePos, vec3 planeDir) {
+    float s = dot(planeDir, center - planePos);
+    float r = dot(abs(planeDir), extents);
+    return (s + r) < 0.0;
+}
+
+bool aabbIntersectsFrustum(vec3 center, vec3 extents) {
+    if (aabbOutsidePlane(center, extents, Npos, Ndir)) return false;
+    if (aabbOutsidePlane(center, extents, Fpos, Fdir)) return false;
+    if (aabbOutsidePlane(center, extents, Rpos, Rdir)) return false;
+    if (aabbOutsidePlane(center, extents, Lpos, Ldir)) return false;
+    if (aabbOutsidePlane(center, extents, Tpos, Tdir)) return false;
+    if (aabbOutsidePlane(center, extents, Bpos, Bdir)) return false;
+    return true;
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= numOfInstances) return;
+
+    mat4 M = instances[id].model;
+
+    vec3 localCenter  = 0.5 * (modelMin + modelMax);
+    vec3 localExtents = 0.5 * (modelMax - modelMin) + bendPaddingLocal;
+
+    vec3 worldCenter = (M * vec4(localCenter, 1.0)).xyz;
+
+    mat3 A = mat3(M);
+    mat3 absA = mat3(
+        abs(A[0][0]), abs(A[0][1]), abs(A[0][2]),
+        abs(A[1][0]), abs(A[1][1]), abs(A[1][2]),
+        abs(A[2][0]), abs(A[2][1]), abs(A[2][2])
+    );
+
+    vec3 worldExtents = absA * localExtents;
+    inside[id] = aabbIntersectsFrustum(worldCenter, worldExtents) ? 1u : 0u;
+}
