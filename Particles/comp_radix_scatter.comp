@@ -1,0 +1,74 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_sort_keys_in {
+    uint keysIn[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer buff_sort_keys_out {
+    uint keysOut[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer buff_indices_in {
+    uint indicesIn[];
+};
+
+layout(std430, set = 0, binding = 3) writeonly buffer buff_indices_out {
+    uint indicesOut[];
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer buff_radix_offsets {
+    uint offsets[];
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer buff_radix_digit_base {
+    uint digitBase[];
+};
+
+layout(std430, set = 0, binding = 6) readonly buffer buff_inside_counter {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance;
+};
+
+layout(binding = 7) uniform Cfg {
+    uint COUNT;
+    uint SHIFT;
+    uint BLOCK_COUNT;
+};
+
+shared uint sDigit[256];
+shared uint sValid[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint block = gl_WorkGroupID.x;
+    uint gid = gl_GlobalInvocationID.x;
+
+    uint valid = (gid < instanceCount) ? 1u : 0u;
+    uint key = valid == 1u ? keysIn[gid] : 0u;
+    uint digit = (key >> SHIFT) & 255u;
+
+    sDigit[lid] = digit;
+    sValid[lid] = valid;
+    barrier();
+
+    if (valid == 0u) return;
+
+    uint localRank = 0u;
+    for (uint i = 0u; i < lid; i++) {
+        if (sValid[i] == 1u && sDigit[i] == digit) {
+            localRank++;
+        }
+    }
+
+    uint dst =
+        digitBase[digit] +
+        offsets[digit * BLOCK_COUNT + block] +
+        localRank;
+
+    keysOut[dst] = key;
+    indicesOut[dst] = indicesIn[gid];
+}

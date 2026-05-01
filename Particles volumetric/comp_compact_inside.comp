@@ -1,0 +1,58 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_inside { uint inside[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer buff_visible_indices { uint visibleIndices[]; };
+layout(std430, set = 0, binding = 2) buffer buff_inside_counter { 
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance; 
+};
+
+layout(binding = 3) uniform Cfg { 
+    uint COUNT; 
+};
+
+shared uint s_scan[gl_WorkGroupSize.x];
+shared uint s_base;
+
+void main() {
+
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    uint particleIndex = 0u;
+    uint flag = 0u;
+    if (gid < COUNT) {
+        flag = inside[gid];
+    }
+
+    // inclusive scan in shared memory
+    s_scan[lid] = flag;
+    barrier();
+
+    for (uint offset = 1u; offset < gl_WorkGroupSize.x; offset <<= 1u) {
+        uint add = 0u;
+        if (lid >= offset) {
+            add = s_scan[lid - offset];
+        }
+        barrier();
+        s_scan[lid] += add;
+        barrier();
+    }
+
+    uint localOffset = s_scan[lid] - flag;   // convert inclusive -> exclusive
+
+    // one atomic per workgroup
+    if (lid == gl_WorkGroupSize.x - 1u) {
+        uint groupCount = s_scan[lid];
+        s_base = atomicAdd(instanceCount, groupCount);
+    }
+    barrier();
+
+    if (flag == 1u) {
+        visibleIndices[s_base + localOffset] = gid;
+    }
+}

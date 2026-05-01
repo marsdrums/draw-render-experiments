@@ -1,0 +1,48 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+struct Particle {
+    vec3 pos;
+    float rad;
+    vec4 col;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer buff_visible_indices {
+    uint visibleIndices[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer buff_sort_keys {
+    uint keys[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer buff_inside_counter {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance;
+};
+
+layout(binding = 4) uniform Cfg {
+    uint COUNT;
+    float NEAR_CLIP;
+    float FAR_CLIP;
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= instanceCount) return;
+
+    uint particleIndex = visibleIndices[gid];
+
+    // In view space, visible points in front of the camera have negative z.
+    // Smaller distance => more front. Ascending radix sort then becomes front-to-back.
+    float d = -particles[particleIndex].pos.z;
+    float t = clamp((d - NEAR_CLIP) / max(FAR_CLIP - NEAR_CLIP, 0.000001), 0.0, 1.0);
+
+    keys[gid] = uint(t * 4294967295.0);
+}

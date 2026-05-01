@@ -1,0 +1,90 @@
+#version 460
+
+#pragma stage(vertex)
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer buff_visible_indices {
+    uint visibleIndices[];
+};
+
+layout(std430, set = 0, binding = 2) buffer buff_inside_counter { 
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance; 
+};
+
+layout(set = 0, binding = 3) uniform Constants {
+    mat4 P;
+};
+
+layout(location = 0) in vec4 offset;
+
+layout(location = 0) out vec4 col;
+layout(location = 1) out vec2 corner;
+layout(location = 2) out vec3 vPos;
+layout(location = 3) out float rad;
+
+void main() {
+
+    uint srcIndex = visibleIndices[instanceCount - gl_InstanceIndex];
+    Particle p = particles[srcIndex];
+    corner = offset.xy;
+    gl_Position = P * vec4(p.pos + offset.xyz*p.rad, 1.0);
+    col = p.col;
+    vPos = p.pos;
+    rad = p.rad;
+
+}
+
+#pragma stage(fragment)
+
+layout(set = 0, binding = 3) uniform Constants {
+    mat4 P;
+};
+
+layout(location = 0) in vec4 col;
+layout(location = 1) in vec2 corner;
+layout(location = 2) in vec3 vPos;
+layout(location = 3) in float rad;
+
+layout(location = 0) out vec4 fragColor;
+
+void main()
+{
+    float r2 = dot(corner, corner);
+
+    if (r2 > 1.0)
+        discard;
+
+    fragColor.rgb = vec3(1.0);
+    fragColor.a = smoothstep(0.0, 0.3, 1.0 - r2) * 0.01;
+
+/*
+    // Exact front hemisphere
+    float z = sqrt(1.0 - r2); //incorrect, but cheaper
+
+    // Already normalized: no normalize() needed
+    vec3 N = vec3(corner, z);
+
+    // Only view-space Z is needed for depth
+    float viewZ = vPos.z + z * rad;
+
+    float clipZ = P[2][2] * viewZ + P[3][2];
+    float clipW = P[2][3] * viewZ + P[3][3];
+    float ndcDepth = clipZ / clipW;
+
+    gl_FragDepth = ndcDepth * 0.5 + 0.5;
+
+    fragColor = vec4(N, 1.0);
+*/
+}

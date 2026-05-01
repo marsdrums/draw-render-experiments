@@ -1,0 +1,61 @@
+// compare the particles' AABBs and check if they're inside the view frustum
+#version 460
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+};
+
+layout(std430, set = 0, binding = 0) buffer readonly buff_particles {
+    Particle particles[];
+};
+
+layout(std430, set = 0, binding = 1) buffer writeonly buff_inside {
+    uint inside[];
+};
+
+layout(binding = 2) uniform Cfg {
+    
+    vec3 Npos;
+    vec3 Fpos;
+    vec3 Rpos;
+    vec3 Lpos;
+    vec3 Tpos;
+    vec3 Bpos;
+
+    vec3 Ndir;
+    vec3 Fdir;
+    vec3 Rdir;
+    vec3 Ldir;
+    vec3 Tdir;
+    vec3 Bdir;
+
+    uint COUNT;
+};
+
+bool aabbOutsidePlane(vec3 center, vec3 extents, vec3 planePos, vec3 planeDir) {
+    float s = dot(planeDir, center - planePos);
+    float r = dot(abs(planeDir), extents);
+    return (s + r) < 0.0;
+}
+
+bool aabbIntersectsFrustum(vec3 center, vec3 extents) {
+    if (aabbOutsidePlane(center, extents, Npos, Ndir)) return false;
+    if (aabbOutsidePlane(center, extents, Fpos, Fdir)) return false;
+    if (aabbOutsidePlane(center, extents, Rpos, Rdir)) return false;
+    if (aabbOutsidePlane(center, extents, Lpos, Ldir)) return false;
+    if (aabbOutsidePlane(center, extents, Tpos, Tdir)) return false;
+    if (aabbOutsidePlane(center, extents, Bpos, Bdir)) return false;
+    return true;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= COUNT) return;
+
+    Particle p = particles[gid];
+    inside[gid] = aabbIntersectsFrustum(p.pos, vec3(p.rad)) ? 1u : 0u;
+}

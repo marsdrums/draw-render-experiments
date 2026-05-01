@@ -1,0 +1,40 @@
+#version 460
+
+layout(local_size_x = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_radix_hist {
+    uint hist[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer buff_radix_offsets {
+    uint offsets[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer buff_radix_digit_base {
+    uint digitBase[];
+};
+
+layout(binding = 3) uniform Cfg {
+    uint BLOCK_COUNT;
+};
+
+void main() {
+    uint digit = gl_WorkGroupID.x;
+
+    uint base = 0u;
+
+    for (uint d = 0u; d < digit; d++) {
+        for (uint b = 0u; b < BLOCK_COUNT; b++) {
+            base += hist[d * BLOCK_COUNT + b];
+        }
+    }
+
+    digitBase[digit] = base;
+
+    uint running = 0u;
+    for (uint b = 0u; b < BLOCK_COUNT; b++) {
+        uint idx = digit * BLOCK_COUNT + b;
+        offsets[idx] = running;
+        running += hist[idx];
+    }
+}

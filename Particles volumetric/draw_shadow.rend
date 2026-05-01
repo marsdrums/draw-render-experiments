@@ -1,0 +1,53 @@
+#version 460
+
+#pragma stage(vertex)
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+layout(set = 0, binding = 1) uniform Constants {
+    mat4 V;
+    mat4 P;
+};
+
+layout(location = 0) in vec4 offset;
+
+layout(location = 0) out vec2 corner;
+
+
+void main() {
+
+    Particle p = particles[gl_InstanceIndex];
+    corner = offset.xy;
+    vec3 vPos = (V * vec4(p.pos, 1.0)).xyz;
+    gl_Position = P * vec4(vPos + offset.xyz*p.rad, 1.0);
+}
+
+#pragma stage(fragment)
+
+
+layout(location = 0) in vec2 corner;
+
+layout(location = 0) out vec4 fragColor;
+
+void main()
+{
+
+    float r2 = dot(corner, corner);
+    if (r2 > 1.0){
+        discard;
+        return;
+    } 
+
+    fragColor.rgb = vec3(1);
+    fragColor.a = smoothstep(0.0, 0.3, 1.0 - r2) * 0.01;
+}

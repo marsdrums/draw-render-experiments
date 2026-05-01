@@ -1,0 +1,33 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer buff_radix_hist {
+    uint hist[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer buff_radix_offsets {
+    uint offsets[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer buff_radix_digit_base {
+    uint digitBase[];
+};
+
+layout(binding = 3) uniform Cfg {
+    uint BLOCK_COUNT;
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = BLOCK_COUNT * 256u;
+
+    if (gid < total) {
+        hist[gid] = 0u;
+        offsets[gid] = 0u;
+    }
+
+    if (gid < 256u) {
+        digitBase[gid] = 0u;
+    }
+}

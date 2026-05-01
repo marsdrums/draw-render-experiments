@@ -1,0 +1,64 @@
+#version 460
+
+// Each workgroup launches 128 invocations (threads) in the X dimension.
+layout(local_size_x = 128) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+};
+
+layout(std430, set = 0, binding = 0) buffer buff_particles {
+    Particle particles[];
+};
+
+// Push-constant-like uniform block carrying per-dispatch parameters that define
+// which compare-exchange pairs this pass should process.
+layout(binding = 1) uniform push_constants {
+    uint groupWidth;   // Width of a "bitonic group" for the current stage/step (power of two).
+    uint groupHeight;  // Height/stride term derived from groupWidth (2*groupWidth - 1).
+    uint stepIndex;    // Which step within the current stage we are executing.
+    uint numValues;    // Actual number of valid elements in val[].
+};
+
+void main() {
+
+    // Global invocation index (the "thread id" across all workgroups).
+    // Only X is used because this is a 1D dispatch.
+    uint gid = gl_GlobalInvocationID.x;
+
+    // Compute position inside the current group:
+    // h ranges from 0..groupWidth-1 by masking lower bits (requires groupWidth is power-of-two).
+    uint h = gid & (groupWidth - 1u);
+
+    // Compute the base index (low element) for this thread's compare-exchange pair.
+    // gid / groupWidth selects which group this thread belongs to.
+    // (groupHeight + 1) is the distance between consecutive groups in the flattened array.
+    uint indexLow = h + (groupHeight + 1u) * (gid / groupWidth);
+
+    // Compute the partner index (high element) to compare against.
+    // For stepIndex == 0: partner depends on h (pc.groupHeight - 2*h), which flips direction
+    // across the group to form the initial bitonic merge pattern.
+    // For subsequent steps: partner uses a constant offset of (groupHeight + 1)/2.
+    uint indexHigh = indexLow + (stepIndex == 0u
+        ? groupHeight - 2u * h
+        : (groupHeight + 1u) / 2u);
+
+    // Bounds check for the upper index (common when numValues is not a power-of-two
+    // but the algorithm dispatches as if it were padded to nextPow2).
+    if (indexHigh >= numValues) return;
+
+    // Load both elements to be compared.
+    Particle pLow = particles[indexLow];
+    Particle pHi = particles[indexHigh];
+
+    // Compare-and-swap (ascending order):
+    // If the low value is greater than the high value, swap them in the buffer.
+    if (pLow.key > pHi.key) {
+        particles[indexLow]  = pHi;
+        particles[indexHigh] = pLow;
+    }
+}
