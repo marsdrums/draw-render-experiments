@@ -13,17 +13,6 @@
         "boxes": [
             {
                 "box": {
-                    "id": "obj-29",
-                    "linecount": 2,
-                    "maxclass": "comment",
-                    "numinlets": 1,
-                    "numoutlets": 0,
-                    "patching_rect": [ 801.0, 94.5, 291.0, 47.0 ],
-                    "text": "Do a bang to jit.gpu.render clears the render targets?\n\n"
-                }
-            },
-            {
-                "box": {
                     "id": "obj-27",
                     "maxclass": "message",
                     "numinlets": 2,

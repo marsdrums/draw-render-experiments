@@ -24,6 +24,7 @@ layout(binding = 1) uniform Cfg {
     float SCALE;
     vec3 HALF_VECTOR;
     uint FLIPPED;
+    float RADIUS;
 };
 
 void main() {
@@ -40,7 +41,7 @@ void main() {
     p.pos.x = pnoise(seed,                      vec3(100.0));
     p.pos.y = pnoise(seed + vec3(1,2,3)*100,    vec3(200.0));
     p.pos.z = pnoise(seed + vec3(1,2,3)*200,    vec3(300.0));
-    p.rad = 0.005;
+    p.rad = RADIUS;
     p.col = vec4(sin(float(gid) * vec3(1,2,3))*0.5 + 0.5,1);
     p.id = gid;
     p.key = dot(HALF_VECTOR, p.pos);

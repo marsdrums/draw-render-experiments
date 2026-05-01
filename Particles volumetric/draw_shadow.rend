@@ -17,6 +17,7 @@ layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
 layout(set = 0, binding = 1) uniform Constants {
     mat4 V;
     mat4 P;
+    float ALPHA;
 };
 
 layout(location = 0) in vec4 offset;
@@ -39,6 +40,12 @@ layout(location = 0) in vec2 corner;
 
 layout(location = 0) out vec4 fragColor;
 
+layout(set = 0, binding = 1) uniform Constants {
+    mat4 V;
+    mat4 P;
+    float ALPHA;
+};
+
 void main()
 {
 
@@ -49,5 +56,5 @@ void main()
     } 
 
     fragColor.rgb = vec3(1);
-    fragColor.a = smoothstep(0.0, 0.3, 1.0 - r2) * 0.01;
+    fragColor.a = smoothstep(0.0, 0.3, 1.0 - r2) * ALPHA;
 }

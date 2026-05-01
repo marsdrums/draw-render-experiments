@@ -5,13 +5,16 @@ const m = require("Patcher://vector_math.js");
 let TIME = 0;
 let VIEWPORT = [1920, 1080];
 let RATIO = VIEWPORT[0] / VIEWPORT[1];
+let RADIUS = 0.01;
+let ALPHA = 0.02;
 let pos, at, farClip, nearClip, lensAngle, viewDir;
 let numStages;
 let sliceSize;
 let particleCount;
-const sliceCount = 64;
+const sliceCount = 128;
 
-let lightDir = normalizeVec3([1,-1,1]);
+
+let lightDir = normalizeVec3([1,1,1]);
 let halfVector, flipped;
 
 let proxy_camera = new JitterObject("jit.proxy");
@@ -49,9 +52,8 @@ comp_reset_inside_counter.bind("buff_inside_counter", buff_inside_counter.name);
 let comp_generate_position = new JitterObject("jit.gpu.compute");
 comp_generate_position.file = "comp_generate_position.comp";
 comp_generate_position.bind("buff_particles", buff_particles.name);
+comp_generate_position.param("RADIUS", RADIUS);
 
-
-// Bitonic Mergesort - https://en.wikipedia.org/wiki/Bitonic_sorter
 var comp_sort = new JitterObject("jit.gpu.compute");
 comp_sort.shader = "comp_sort.comp";
 comp_sort.bind("buff_particles", buff_particles.name);
@@ -76,9 +78,11 @@ draw_shadow.topology = "trianglestrip";
 draw_shadow.elemcount = 4;
 draw_shadow.blendenable = true;
 draw_shadow.depth_write = false;
+draw_shadow.param("ALPHA", ALPHA);
 
 // Shadow map
-let shadowMapSize = 1024;
+let shadowMapSize = 512;
+let shadow_clear_mat = new JitterMatrix(1, "float32", shadowMapSize, shadowMapSize);
 let img_shadow_map = new JitterObject("jit.gpu.image");
 img_shadow_map.dim = [shadowMapSize, shadowMapSize];
 img_shadow_map.format = "rgba32_float";
@@ -89,6 +93,7 @@ render_shadow.depth = false;
 render_shadow.depthimg = img_shadow_map.name;
 render_shadow.colorimg0 = img_shadow_map.name;
 render_shadow.clearcolor0 = [0, 0, 0, 0];
+render_shadow.colorloadop0 = "load";
 
 // main pass
 
@@ -103,14 +108,20 @@ draw_particles.topology = "trianglestrip";
 draw_particles.elemcount = 4;
 draw_particles.blendenable = true;//true;
 draw_particles.depth_write = false;
+draw_particles.param("ALPHA", ALPHA);
+//draw_particles.blendcolordst = "one";
+//draw_particles.blendcolorsrc = "inv_src_color";
 
+let particles_clear_mat = new JitterMatrix(4, "float32", VIEWPORT[0], VIEWPORT[1]);
+particles_clear_mat.setall(0.0, 0.2, 0.2, 0.2);
 let render_particles = new JitterObject("jit.gpu.render");
 render_particles.colorattachments = 1;
 render_particles.depth = false;
 render_particles.colorimg0 = img_color_target.name;
-render_particles.clearcolor0 = [0, 0, 0, 0];
+//render_particles.clearcolor0 = [0.2, 0.2, 0.2, 0.0];
 render_particles.depthimg = img_depth_target.name;
 render_particles.msaa = 1;
+render_particles.colorloadop0 = "load";
 
 
 count(100000);
@@ -142,10 +153,10 @@ function compute_half_vector(){
     // Its pseudocode says > 1.0, but normalized vectors cannot exceed 1.0.
     if(dot(viewDir, lightDir) > 0.0) {
         halfVector = normalizeVec3(sumVec3(viewDir, lightDir));
-        flipped = false;
-    } else {
-        halfVector = normalizeVec3(sumVec3(mulVec3Float(viewDir, -1.0), lightDir));
         flipped = true;
+    } else {
+        halfVector = normalizeVec3(sumVec3(mulVec3Float(viewDir, -1.0), mulVec3Float(lightDir, -1.0)));
+        flipped = false;
     }
 }
 
@@ -203,7 +214,7 @@ function calc_matrices() {
 
     let up = [0, 1, 0];
 
-    let lightPos = new Float32Array([-lightDir[0] * 6, -lightDir[1] * 6, -lightDir[2] * 6]);
+    let lightPos = new Float32Array([-lightDir[0] * 3, -lightDir[1] * 3, -lightDir[2] * 3]);
 
     return {
         V: m.lookAt(pos, at, up),
@@ -228,6 +239,12 @@ function sort_particles(){
     }
 }
 
+function clear_color_attachments(){
+
+    img_color_target.jit_matrix(particles_clear_mat.name);
+    img_shadow_map.jit_matrix(shadow_clear_mat.name);
+}
+
 function bang() {
 
     let transfrom = calc_matrices();
@@ -241,7 +258,6 @@ function bang() {
 
     sort_particles();
 
-    //sliced rendering
     draw_particles.param("V", transfrom.V);
     draw_particles.param("P", transfrom.P);
     draw_particles.param("ligV", transfrom.ligV);
@@ -250,22 +266,28 @@ function bang() {
     draw_shadow.param("V", transfrom.ligV);
     draw_shadow.param("P", transfrom.ligP);
 
+    clear_color_attachments();
 
-    for(let i = 0; i < sliceCount; i++){
+    //sliced rendering
+    for (let si = 0; si < sliceCount; si++) {
+        let i = flipped ? (sliceCount - 1 - si) : si;
         let offset = sliceSize * i;
-        
-        comp_set_slice.param("pc.instanceCount", Math.min(particleCount, offset + sliceSize) - offset);
+
+        let count = Math.min(particleCount, offset + sliceSize) - offset;
+        if (count <= 0) continue;
+
+        comp_set_slice.param("pc.instanceCount", count);
         comp_set_slice.param("pc.firstInstance", offset);
         comp_set_slice.bang();
 
+        // Eye pass: uses shadow/light buffer accumulated from previous slices.
         render_particles.jit_gpu_draw(draw_particles.name);
         render_particles.bang();
+
+        // Shadow pass: updates light buffer with this slice for later slices.
         render_shadow.jit_gpu_draw(draw_shadow.name);
         render_shadow.bang();
     }
-
-    render_particles.bang();
-
 
     outlet(0, "source", img_color_target.name);
     outlet(0, "bang");
