@@ -1,0 +1,21 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(r32f, binding = 0) uniform readonly image2D img_shadow_src;
+layout(r32f, binding = 1) uniform writeonly image2D img_shadow_dst;
+
+void main()
+{
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(img_shadow_src);
+
+    if (gid.x >= size.x || gid.y >= size.y) {
+        return;
+    }
+
+    float val = imageLoad(img_shadow_src, gid).x*0.5;
+    val += imageLoad(img_shadow_src, clamp(gid - ivec2(0,1), ivec2(0), size-1)).x*0.25;
+    val += imageLoad(img_shadow_src, clamp(gid + ivec2(0,1), ivec2(0), size-1)).x*0.25;
+    imageStore(img_shadow_dst, gid, vec4(val));
+}

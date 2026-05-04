@@ -6,20 +6,18 @@ let TIME = 0;
 let VIEWPORT = [1920, 1080];
 let RATIO = VIEWPORT[0] / VIEWPORT[1];
 let RADIUS = 0.01;
-let ALPHA = 0.02;
+let ALPHA = 0.05;
 let pos, at, farClip, nearClip, lensAngle, viewDir;
-let numStages;
-let sliceSize;
-let particleCount;
-const sliceCount = 128;
+let particleCount = 0;
+let sliceCount = 64;       // variable; call slice_count(N) or bins(N)
+let radius_multiplier = 1.0;
 
-
-let lightDir = normalizeVec3([1,1,1]);
+let lightDir = normalizeVec3([0.3, 1, -0.2]);
 let halfVector, flipped;
 
 let proxy_camera = new JitterObject("jit.proxy");
 
-// particle buffer: Pos(vec3), rad(float), col(vec4);
+// Particle: vec3 pos, float rad, vec4 col, float key, uint id. std430 stride = 48 bytes.
 let buff_particles = new JitterObject("jit.gpu.buffer");
 
 let buff_quad = new JitterObject("jit.gpu.buffer");
@@ -30,62 +28,93 @@ mat_quad.setcell(2, "val", [-1, +1, 0, 0]);
 mat_quad.setcell(3, "val", [+1, +1, 0, 0]);
 buff_quad.jit_matrix(mat_quad.name);
 
+// Current indirect draw args: vertexCount, instanceCount, firstVertex, firstInstance.
 let buff_slice = new JitterObject("jit.gpu.buffer");
 buff_slice.bytecount = 4 * 4;
 
-let comp_set_slice = new JitterObject("jit.gpu.compute");
-comp_set_slice.shader = "comp_set_slice.comp";
-comp_set_slice.workgroups = [1,1,1];
-comp_set_slice.bind("buff_slice", buff_slice.name);
-
-let buff_inside_counter = new JitterObject("jit.gpu.buffer"); // indirect draw args / visible count
-buff_inside_counter.bytecount = 4 * 4;
-
-let buff_inside = new JitterObject("jit.gpu.buffer"); // per-particle visibility flag
-let buff_visible_indices = new JitterObject("jit.gpu.buffer");
-
-let comp_reset_inside_counter = new JitterObject("jit.gpu.compute");
-comp_reset_inside_counter.file = "comp_reset_inside_counter.comp";
-comp_reset_inside_counter.workgroups = [1, 1, 1];
-comp_reset_inside_counter.bind("buff_inside_counter", buff_inside_counter.name);
+// Slice/bucket buffers.
+// binCounts[i]       = particle count in bin i
+// binOffsets[i]      = exclusive prefix-sum start of bin i in bucketIndices
+// binWriteCounts[i]  = temporary atomic cursor used while filling bucketIndices
+// bucketIndices[k]   = particle index to render for logical instance k
+let buff_bin_counts = new JitterObject("jit.gpu.buffer");
+let buff_bin_offsets = new JitterObject("jit.gpu.buffer");
+let buff_bin_write_counts = new JitterObject("jit.gpu.buffer");
+let buff_bucket_indices = new JitterObject("jit.gpu.buffer");
 
 let comp_generate_position = new JitterObject("jit.gpu.compute");
 comp_generate_position.file = "comp_generate_position.comp";
 comp_generate_position.bind("buff_particles", buff_particles.name);
 comp_generate_position.param("RADIUS", RADIUS);
 
-var comp_sort = new JitterObject("jit.gpu.compute");
-comp_sort.shader = "comp_sort.comp";
-comp_sort.bind("buff_particles", buff_particles.name);
+let comp_reset_bins = new JitterObject("jit.gpu.compute");
+comp_reset_bins.file = "comp_reset_bins.comp";
+comp_reset_bins.bind("buff_bin_counts", buff_bin_counts.name);
+comp_reset_bins.bind("buff_bin_offsets", buff_bin_offsets.name);
+comp_reset_bins.bind("buff_bin_write_counts", buff_bin_write_counts.name);
+
+let comp_count_bins = new JitterObject("jit.gpu.compute");
+comp_count_bins.file = "comp_count_bins.comp";
+comp_count_bins.bind("buff_particles", buff_particles.name);
+comp_count_bins.bind("buff_bin_counts", buff_bin_counts.name);
+
+let comp_prefix_bins = new JitterObject("jit.gpu.compute");
+comp_prefix_bins.file = "comp_prefix_bins.comp";
+comp_prefix_bins.workgroups = [1, 1, 1];
+comp_prefix_bins.bind("buff_bin_counts", buff_bin_counts.name);
+comp_prefix_bins.bind("buff_bin_offsets", buff_bin_offsets.name);
+comp_prefix_bins.bind("buff_bin_write_counts", buff_bin_write_counts.name);
+
+let comp_fill_bins = new JitterObject("jit.gpu.compute");
+comp_fill_bins.file = "comp_fill_bins.comp";
+comp_fill_bins.bind("buff_particles", buff_particles.name);
+comp_fill_bins.bind("buff_bin_offsets", buff_bin_offsets.name);
+comp_fill_bins.bind("buff_bin_write_counts", buff_bin_write_counts.name);
+comp_fill_bins.bind("buff_bucket_indices", buff_bucket_indices.name);
+
+let comp_set_bin_slice = new JitterObject("jit.gpu.compute");
+comp_set_bin_slice.file = "comp_set_bin_slice.comp";
+comp_set_bin_slice.workgroups = [1, 1, 1];
+comp_set_bin_slice.bind("buff_slice", buff_slice.name);
+comp_set_bin_slice.bind("buff_bin_counts", buff_bin_counts.name);
+comp_set_bin_slice.bind("buff_bin_offsets", buff_bin_offsets.name);
 
 let img_color_target = new JitterObject("jit.gpu.image");
 img_color_target.dim = [VIEWPORT[0], VIEWPORT[1]];
 img_color_target.format = "rgba32_float";
 
-let img_depth_target = new JitterObject("jit.gpu.image");
-img_depth_target.dim = [VIEWPORT[0], VIEWPORT[1]];
-img_depth_target.format = "d32_float";
+let shadowMapSize = 1024;
+let img_shadow_map = new JitterObject("jit.gpu.image");
+img_shadow_map.dim = [shadowMapSize, shadowMapSize];
+img_shadow_map.format = "r32_float";
 
-// shadow pass
+// Ping-pong target for separable shadow blur. Do not blur img_shadow_map in-place.
+let img_shadow_tmp = new JitterObject("jit.gpu.image");
+img_shadow_tmp.dim = [shadowMapSize, shadowMapSize];
+img_shadow_tmp.format = "r32_float";
 
+let comp_clear_color_target = new JitterObject("jit.gpu.compute");
+comp_clear_color_target.file = "comp_clear_color_target.comp";
+comp_clear_color_target.bind("img_color_target", img_color_target.name);
+comp_clear_color_target.workgroups = [Math.ceil(VIEWPORT[0] / 16), Math.ceil(VIEWPORT[1] / 16), 1];
+
+let comp_clear_shadow_map = new JitterObject("jit.gpu.compute");
+comp_clear_shadow_map.file = "comp_clear_shadow_map.comp";
+comp_clear_shadow_map.bind("img_shadow_map", img_shadow_map.name);
+comp_clear_shadow_map.workgroups = [Math.ceil(shadowMapSize / 16), Math.ceil(shadowMapSize / 16), 1];
+
+// Shadow pass.
 let draw_shadow = new JitterObject("jit.gpu.draw");
-draw_shadow.shader = "draw_shadow.rend";
+draw_shadow.shader = "draw_shadow_bucketed.rend";
 draw_shadow.vb0 = buff_quad.name;
 draw_shadow.buff_particles = buff_particles.name;
+draw_shadow.buff_bucket_indices = buff_bucket_indices.name;
 draw_shadow.indirect = buff_slice.name;
-draw_shadow.buff_inside_counter = buff_inside_counter.name;
 draw_shadow.topology = "trianglestrip";
 draw_shadow.elemcount = 4;
 draw_shadow.blendenable = true;
 draw_shadow.depth_write = false;
 draw_shadow.param("ALPHA", ALPHA);
-
-// Shadow map
-let shadowMapSize = 512;
-let shadow_clear_mat = new JitterMatrix(1, "float32", shadowMapSize, shadowMapSize);
-let img_shadow_map = new JitterObject("jit.gpu.image");
-img_shadow_map.dim = [shadowMapSize, shadowMapSize];
-img_shadow_map.format = "rgba32_float";
 
 let render_shadow = new JitterObject("jit.gpu.render");
 render_shadow.colorattachments = 1;
@@ -95,34 +124,42 @@ render_shadow.colorimg0 = img_shadow_map.name;
 render_shadow.clearcolor0 = [0, 0, 0, 0];
 render_shadow.colorloadop0 = "load";
 
-// main pass
-
+// Eye pass.
 let draw_particles = new JitterObject("jit.gpu.draw");
-draw_particles.shader = "draw_particles.rend";
+draw_particles.shader = "draw_particles_bucketed.rend";
 draw_particles.vb0 = buff_quad.name;
 draw_particles.buff_particles = buff_particles.name;
+draw_particles.buff_bucket_indices = buff_bucket_indices.name;
 draw_particles.indirect = buff_slice.name;
-draw_particles.buff_inside_counter = buff_inside_counter.name;
 draw_particles.img_shadow_map = img_shadow_map.name;
+draw_particles.img_prev_slice = img_color_target.name;
 draw_particles.topology = "trianglestrip";
 draw_particles.elemcount = 4;
-draw_particles.blendenable = true;//true;
+draw_particles.blendenable = true;
 draw_particles.depth_write = false;
 draw_particles.param("ALPHA", ALPHA);
-//draw_particles.blendcolordst = "one";
-//draw_particles.blendcolorsrc = "inv_src_color";
 
-let particles_clear_mat = new JitterMatrix(4, "float32", VIEWPORT[0], VIEWPORT[1]);
-particles_clear_mat.setall(0.0, 0.2, 0.2, 0.2);
 let render_particles = new JitterObject("jit.gpu.render");
 render_particles.colorattachments = 1;
 render_particles.depth = false;
 render_particles.colorimg0 = img_color_target.name;
-//render_particles.clearcolor0 = [0.2, 0.2, 0.2, 0.0];
-render_particles.depthimg = img_depth_target.name;
 render_particles.msaa = 1;
 render_particles.colorloadop0 = "load";
 
+// Separable Gaussian blur for the light/shadow buffer.
+// H: img_shadow_map -> img_shadow_tmp
+// V: img_shadow_tmp -> img_shadow_map
+let comp_blur_shadow_h = new JitterObject("jit.gpu.compute");
+comp_blur_shadow_h.file = "comp_blur_shadow_h.comp";
+comp_blur_shadow_h.bind("img_shadow_src", img_shadow_map.name);
+comp_blur_shadow_h.bind("img_shadow_dst", img_shadow_tmp.name);
+comp_blur_shadow_h.workgroups = [Math.ceil(shadowMapSize / 16), Math.ceil(shadowMapSize / 16), 1];
+
+let comp_blur_shadow_v = new JitterObject("jit.gpu.compute");
+comp_blur_shadow_v.file = "comp_blur_shadow_v.comp";
+comp_blur_shadow_v.bind("img_shadow_src", img_shadow_tmp.name);
+comp_blur_shadow_v.bind("img_shadow_dst", img_shadow_map.name);
+comp_blur_shadow_v.workgroups = [Math.ceil(shadowMapSize / 16), Math.ceil(shadowMapSize / 16), 1];
 
 count(100000);
 
@@ -130,7 +167,6 @@ function camera_name(name) {
     proxy_camera.name = name;
 }
 
-// VECTOR MATH
 function normalizeVec3(v) {
     const len = Math.hypot(v[0], v[1], v[2]);
     if (len === 0) return new Float32Array([0, 0, 0]);
@@ -139,19 +175,14 @@ function normalizeVec3(v) {
 }
 function mulVec3Float(a, b) { return [a[0] * b, a[1] * b, a[2] * b]; }
 function sumVec3(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
-function subVec3(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
-function cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
-function dot(a, b){ return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 
-function light_direction(){
+function light_direction() {
     lightDir = normalizeVec3([arguments[0], arguments[1], arguments[2]]);
 }
 
-function compute_half_vector(){
-
-    // The paper's prose describes the branch as positive vs. negative dot product.
-    // Its pseudocode says > 1.0, but normalized vectors cannot exceed 1.0.
-    if(dot(viewDir, lightDir) > 0.0) {
+function compute_half_vector() {
+    if (dot(viewDir, lightDir) > 0.0) {
         halfVector = normalizeVec3(sumVec3(viewDir, lightDir));
         flipped = true;
     } else {
@@ -160,43 +191,62 @@ function compute_half_vector(){
     }
 }
 
-function nextPowerOfTwo(N){ //bit-twiddling
-    if (N <= 1){ return 1; }
-    N--;
-    N |= N >> 1; N |= N >> 2; N |= N >> 4; N |= N >> 8; N |= N >> 16;
-    return N + 1;
+function configure_bucket_buffers() {
+    const SIZE_OF_UINT = 4;
+
+    buff_bin_counts.bytecount = sliceCount * SIZE_OF_UINT;
+    buff_bin_offsets.bytecount = sliceCount * SIZE_OF_UINT;
+    buff_bin_write_counts.bytecount = sliceCount * SIZE_OF_UINT;
+
+    comp_reset_bins.workgroups = [Math.ceil(sliceCount / 256), 1, 1];
+    comp_reset_bins.param("BIN_COUNT", sliceCount);
+    comp_count_bins.param("BIN_COUNT", sliceCount);
+    comp_prefix_bins.param("BIN_COUNT", sliceCount);
+    comp_fill_bins.param("BIN_COUNT", sliceCount);
+    comp_set_bin_slice.param("BIN_COUNT", sliceCount);
 }
 
 function count(N) {
+    particleCount = Math.max(1, Math.floor(N));
 
-    particleCount = N;
-
-    let np2 = nextPowerOfTwo(N);
-    numStages = Math.log2(np2);
-    
-    comp_sort.workgroups = [Math.ceil((np2 / 2) / 128), 1, 1];
-    comp_sort.param("numValues", N);
-
-    const SIZE_OF_FLOAT = 4;
     const SIZE_OF_UINT = 4;
+    const PARTICLE_STRIDE = 48;
 
-    comp_generate_position.workgroups   = [Math.ceil(N / 256), 1, 1];
+    buff_particles.bytecount = particleCount * PARTICLE_STRIDE;
+    buff_bucket_indices.bytecount = particleCount * SIZE_OF_UINT;
 
-    // Particle and visibility buffers track the requested count exactly.
-    buff_particles.bytecount = N * 48;//N * (SIZE_OF_FLOAT * 9 + SIZE_OF_UINT);
-    buff_inside.bytecount = N * SIZE_OF_UINT;
-    buff_visible_indices.bytecount = N * SIZE_OF_UINT;
+    comp_generate_position.workgroups = [Math.ceil(particleCount / 256), 1, 1];
+    comp_generate_position.param("COUNT", particleCount);
+    comp_generate_position.param("SQRT_COUNT", Math.ceil(Math.sqrt(particleCount)));
 
-    // Set params for existing passes.
-    comp_generate_position.param("COUNT", N);
-    comp_generate_position.param("SQRT_COUNT", Math.ceil(Math.sqrt(Math.max(1, N))));
+    comp_count_bins.workgroups = [Math.ceil(particleCount / 256), 1, 1];
+    comp_count_bins.param("COUNT", particleCount);
 
-    // Indirect draw uses buff_inside_counter.instanceCount. This is just the
-    // non-indirect upper bound/debug fallback.
-    //draw_particles.instancecount = N;
-    //draw_shadow.instancecount = N;
+    comp_fill_bins.workgroups = [Math.ceil(particleCount / 256), 1, 1];
+    comp_fill_bins.param("COUNT", particleCount);
 
-    sliceSize = Math.ceil(N / sliceCount);
+    // Non-indirect fallback only. The real count comes from buff_slice.
+    draw_particles.instancecount = particleCount;
+    draw_shadow.instancecount = particleCount;
+
+    configure_bucket_buffers();
+}
+
+// Variable number of bins/slices. Use this from Max: slice_count 32, slice_count 64, etc.
+function slice_count(N) {
+    sliceCount = Math.max(1, Math.floor(N));
+    configure_bucket_buffers();
+}
+
+// Alias, because "bins 64" reads nicely in the patcher.
+function bins(N) {
+    slice_count(N);
+}
+
+function blur_shadow_map() {
+
+    comp_blur_shadow_h.bang();
+    comp_blur_shadow_v.bang();
 }
 
 function time(T) {
@@ -204,7 +254,6 @@ function time(T) {
 }
 
 function calc_matrices() {
-
     pos = proxy_camera.send("getposition");
     at = proxy_camera.send("getlookat");
     farClip = proxy_camera.send("getfar_clip");
@@ -213,7 +262,6 @@ function calc_matrices() {
     viewDir = proxy_camera.send("getdirection");
 
     let up = [0, 1, 0];
-
     let lightPos = new Float32Array([-lightDir[0] * 3, -lightDir[1] * 3, -lightDir[2] * 3]);
 
     return {
@@ -224,69 +272,77 @@ function calc_matrices() {
     };
 }
 
-function sort_particles(){
+function update_bucket_key_range() {
+    // Particle positions are generated roughly in [-1,1]^3 plus jitter.
+    // The exact projection range along halfVector is the box extent projected onto halfVector.
+    // Add radius/jitter padding so particles near the edge do not clamp too aggressively.
+    let boxExtent = 1.0 + RADIUS + 0.02;
+    let projectedExtent = boxExtent * (Math.abs(halfVector[0]) + Math.abs(halfVector[1]) + Math.abs(halfVector[2]));
+    projectedExtent = Math.max(projectedExtent, 0.0001);
 
-    for(let stageIndex = 0; stageIndex < numStages; stageIndex++){
-        for(let stepIndex = 0; stepIndex < stageIndex + 1; stepIndex++){
-            
-            let groupWidth = 1 << (stageIndex - stepIndex);
-            let groupHeight = 2 * groupWidth - 1;
-            comp_sort.param("groupWidth", groupWidth);
-            comp_sort.param("groupHeight", groupHeight);
-            comp_sort.param("stepIndex", stepIndex);
-            comp_sort.bang();
-        }
-    }
+    let keyMin = -projectedExtent;
+    let keyInvRange = 1.0 / (2.0 * projectedExtent);
+
+    comp_count_bins.param("KEY_MIN", keyMin);
+    comp_count_bins.param("KEY_INV_RANGE", keyInvRange);
+    comp_fill_bins.param("KEY_MIN", keyMin);
+    comp_fill_bins.param("KEY_INV_RANGE", keyInvRange);
 }
 
-function clear_color_attachments(){
+function build_slice_buckets() {
+    comp_reset_bins.bang();
+    comp_count_bins.bang();
+    comp_prefix_bins.bang();
+    comp_fill_bins.bang();
+}
 
-    img_color_target.jit_matrix(particles_clear_mat.name);
-    img_shadow_map.jit_matrix(shadow_clear_mat.name);
+function clear_color_attachments() {
+    comp_clear_color_target.bang();
+    comp_clear_shadow_map.bang();
 }
 
 function bang() {
-
-    let transfrom = calc_matrices();
+    let transform = calc_matrices();
     compute_half_vector();
 
-    comp_generate_position.param("TIME", TIME);
-    comp_generate_position.param("SCALE", 0.01);
+    comp_generate_position.param("TIME", TIME * 0.1);
+    comp_generate_position.param("SCALE", 0.001);
     comp_generate_position.param("HALF_VECTOR", halfVector);
     comp_generate_position.param("FLIPPED", flipped);
     comp_generate_position.bang();
 
-    sort_particles();
+    update_bucket_key_range();
+    build_slice_buckets();
 
-    draw_particles.param("V", transfrom.V);
-    draw_particles.param("P", transfrom.P);
-    draw_particles.param("ligV", transfrom.ligV);
-    draw_particles.param("ligP", transfrom.ligP);
+    draw_particles.param("V", transform.V);
+    draw_particles.param("P", transform.P);
+    draw_particles.param("ligV", transform.ligV);
+    draw_particles.param("ligP", transform.ligP);
     draw_particles.param("lightDir", lightDir);
-    draw_shadow.param("V", transfrom.ligV);
-    draw_shadow.param("P", transfrom.ligP);
+    draw_shadow.param("V", transform.ligV);
+    draw_shadow.param("P", transform.ligP);
+    draw_shadow.param("radius_multiplier", radius_multiplier);
 
     clear_color_attachments();
 
-    //sliced rendering
+    // Draw bins back-to-front/front-to-back depending on the half-angle branch.
+    // Each iteration writes buff_slice from the GPU-side binCounts/binOffsets.
     for (let si = 0; si < sliceCount; si++) {
-        let i = flipped ? (sliceCount - 1 - si) : si;
-        let offset = sliceSize * i;
+        let binIndex = flipped ? (sliceCount - 1 - si) : si;
 
-        let count = Math.min(particleCount, offset + sliceSize) - offset;
-        if (count <= 0) continue;
+        comp_set_bin_slice.param("BIN_INDEX", binIndex);
+        comp_set_bin_slice.bang();
 
-        comp_set_slice.param("pc.instanceCount", count);
-        comp_set_slice.param("pc.firstInstance", offset);
-        comp_set_slice.bang();
-
-        // Eye pass: uses shadow/light buffer accumulated from previous slices.
         render_particles.jit_gpu_draw(draw_particles.name);
         render_particles.bang();
 
-        // Shadow pass: updates light buffer with this slice for later slices.
         render_shadow.jit_gpu_draw(draw_shadow.name);
         render_shadow.bang();
+
+        // Diffuse the updated light buffer before the next eye slice samples it.
+        // This matches the paper's scattering approximation, but without illegal
+        // read/write feedback on the same image.
+        //blur_shadow_map();
     }
 
     outlet(0, "source", img_color_target.name);

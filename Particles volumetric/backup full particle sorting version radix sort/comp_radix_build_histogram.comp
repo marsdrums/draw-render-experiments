@@ -1,0 +1,40 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+};
+
+layout(std430, set = 0, binding = 0) buffer buff_particles {
+    Particle particles[];
+};
+
+layout(std430, set = 0, binding = 1) buffer buff_radix_histogram {
+    uint histogram[];
+};
+
+layout(binding = 2) uniform Cfg {
+    uint COUNT;
+    //vec3 HALF_VECTOR;
+    float KEY_MIN;
+    float KEY_INV_RANGE;
+};
+
+uint depth_to_key16(float projected) {
+    float t = clamp((projected - KEY_MIN) * KEY_INV_RANGE, 0.0, 1.0);
+    return uint(t * 65535.0 + 0.5);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= COUNT) return;
+
+    uint key = depth_to_key16(particles[gid].key);
+
+    atomicAdd(histogram[key], 1u);
+}

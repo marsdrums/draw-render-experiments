@@ -1,0 +1,32 @@
+#version 460
+
+layout(local_size_x = 1) in;
+
+layout(std430, set = 0, binding = 0) writeonly buffer buff_slice {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer buff_bin_counts {
+    uint binCounts[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer buff_bin_offsets {
+    uint binOffsets[];
+};
+
+layout(binding = 3) uniform Cfg {
+    uint BIN_INDEX;
+    uint BIN_COUNT;
+};
+
+void main() {
+    uint i = min(BIN_INDEX, BIN_COUNT - 1u);
+
+    vertexCount = 4u;
+    instanceCount = binCounts[i];
+    firstVertex = 0u;
+    firstInstance = binOffsets[i];
+}

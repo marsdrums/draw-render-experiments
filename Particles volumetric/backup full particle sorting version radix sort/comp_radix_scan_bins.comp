@@ -1,0 +1,57 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_radix_histogram {
+    uint histogram[];
+};
+
+layout(std430, set = 0, binding = 1) buffer buff_radix_bin_offsets {
+    uint binOffsets[];
+};
+
+layout(std430, set = 0, binding = 2) buffer buff_radix_block_sums {
+    uint blockSums[];
+};
+
+shared uint temp[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint block = gl_WorkGroupID.x;
+    uint gid = block * 256u + lid;
+
+    temp[lid] = histogram[gid];
+    barrier();
+
+    // Blelloch exclusive scan inside this 256-bin block.
+    for (uint offset = 1u; offset < 256u; offset <<= 1u) {
+        uint index = ((lid + 1u) << 1u) * offset - 1u;
+        if (index < 256u) {
+            temp[index] += temp[index - offset];
+        }
+        barrier();
+    }
+
+    uint total = temp[255];
+    if (lid == 0u) {
+        temp[255] = 0u;
+    }
+    barrier();
+
+    for (uint offset = 128u; offset > 0u; offset >>= 1u) {
+        uint index = ((lid + 1u) << 1u) * offset - 1u;
+        if (index < 256u) {
+            uint t = temp[index - offset];
+            temp[index - offset] = temp[index];
+            temp[index] += t;
+        }
+        barrier();
+    }
+
+    binOffsets[gid] = temp[lid];
+
+    if (lid == 0u) {
+        blockSums[block] = total;
+    }
+}

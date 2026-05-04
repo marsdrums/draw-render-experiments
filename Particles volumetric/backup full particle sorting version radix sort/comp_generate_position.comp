@@ -37,18 +37,16 @@ void main() {
     vec3 seed;
     seed.x = float(gid % SQRT_COUNT) * SCALE;
     seed.y = float(gid / SQRT_COUNT) * SCALE;
-    seed.z = TIME;
+    seed.z = 0.0;
     
-    p.pos.x = Normalize(fBmA(seed,                    0.5, 2.0, 1., 6.));
-    p.pos.y = Normalize(fBmA(seed*2.5 + vec3(1,2,3)*100,  0.5, 2.0, 1., 6.));
-    p.pos.z = Normalize(fBmA(seed + vec3(1,2,3)*200,  0.5, 2.0, 1., 6.));
-
-    p.pos.y = fract(p.pos.y + TIME);
+    p.pos.x = Normalize(fBmA(seed                   + TIME,  0.5, 2.0, 1., 6.));
+    p.pos.y = Normalize(fBmA(seed + vec3(1,2,3)*100 + TIME,  0.5, 2.0, 1., 6.));
+    p.pos.z = Normalize(fBmA(seed + vec3(1,2,3)*200 + TIME,  0.5, 2.0, 1., 6.));
 
     p.pos = p.pos*2 - 1;
 
     uint jittSeed = gid + 999u;
-    vec3 jittering = (RandomVec301(jittSeed) - 0.5)*0.03;
+    vec3 jittering = (RandomVec301(jittSeed) - 0.5)*0.01;
 
     p.pos += jittering;
 

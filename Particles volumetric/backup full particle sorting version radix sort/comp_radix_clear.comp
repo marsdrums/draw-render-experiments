@@ -1,0 +1,19 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer buff_radix_histogram {
+    uint histogram[];
+};
+
+layout(std430, set = 0, binding = 1) buffer buff_radix_cursor {
+    uint cursor[];
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= 65536u) return;
+
+    histogram[gid] = 0u;
+    cursor[gid] = 0u;
+}

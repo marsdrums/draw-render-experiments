@@ -1,0 +1,63 @@
+#version 460
+
+// Vertical 9-tap Gaussian blur for an r32f shadow map.
+// One workgroup processes a 128-pixel column segment and caches the segment plus
+// a 4-pixel halo above and below in shared memory.
+
+#define LOCAL_SIZE 128
+#define RADIUS 1
+
+layout(local_size_x = 1, local_size_y = LOCAL_SIZE, local_size_z = 1) in;
+
+layout(r32f, binding = 0) uniform readonly image2D img_src;
+layout(r32f, binding = 1) uniform writeonly image2D img_dst;
+
+shared float tile[LOCAL_SIZE + 2 * RADIUS];
+
+// Normalized sigma ~= 2.0, radius 2, weights sum to 1.0.
+/*
+const float w[3] = float[3](
+    0.402619947,  // offset 0
+    0.244201342,  // offset 1
+    0.054488685   // offset 2
+);
+*/
+
+const float w[2] = float[2](
+    0.5,  // offset 0
+    0.25  // offset 1
+);
+
+float load_shadow(ivec2 p, ivec2 size) {
+    p = clamp(p, ivec2(0), size - ivec2(1));
+    return imageLoad(img_src, p).r;
+}
+
+void main() {
+    ivec2 size = imageSize(img_src);
+
+    uint ly = gl_LocalInvocationID.y;
+    int x = int(gl_WorkGroupID.x);
+    int y0 = int(gl_WorkGroupID.y) * LOCAL_SIZE;
+    int y = y0 + int(ly);
+
+    if (x >= size.x) return;
+
+    tile[int(ly) + RADIUS] = load_shadow(ivec2(x, y), size);
+
+    if (ly < RADIUS) {
+        tile[int(ly)] = load_shadow(ivec2(x, y0 + int(ly) - RADIUS), size);
+        tile[int(ly) + LOCAL_SIZE + RADIUS] = load_shadow(ivec2(x, y0 + LOCAL_SIZE + int(ly)), size);
+    }
+
+    barrier();
+
+    if (y >= size.y) return;
+
+    float sum = 0.0;
+    for (int k = -RADIUS; k <= RADIUS; ++k) {
+        sum += tile[int(ly) + RADIUS + k] * w[abs(k)];
+    }
+
+    imageStore(img_dst, ivec2(x, y), vec4(sum, 0.0, 0.0, 1.0));
+}

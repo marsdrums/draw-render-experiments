@@ -1,0 +1,30 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+};
+
+// Storage buffer for particle data
+layout(std430, set = 0, binding = 0) buffer buff_particles {
+    Particle particles[]; 
+};
+
+layout(binding = 1) uniform Cfg {
+    mat4 V;
+    uint COUNT;
+};
+
+void main() {
+
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= COUNT) return;
+
+    particles[gid].pos = (V * vec4(particles[gid].pos, 1.0)).xyz;
+
+}
