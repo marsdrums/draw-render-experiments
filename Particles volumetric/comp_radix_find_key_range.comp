@@ -1,0 +1,38 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+// sortRange[0] = ordered-float min key, sortRange[1] = ordered-float max key.
+layout(std430, set = 0, binding = 1) buffer buff_sort_range {
+    uint sortRange[];
+};
+
+layout(binding = 2) uniform Cfg {
+    uint COUNT;
+};
+
+uint float_to_ordered_uint(float v) {
+    uint u = floatBitsToUint(v);
+    return ((u & 0x80000000u) != 0u) ? ~u : (u ^ 0x80000000u);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= COUNT) return;
+
+    uint orderedKey = float_to_ordered_uint(particles[gid].key);
+    atomicMin(sortRange[0], orderedKey);
+    atomicMax(sortRange[1], orderedKey);
+}

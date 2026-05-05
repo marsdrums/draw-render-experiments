@@ -11,5 +11,5 @@ void main() {
 
     if (gid.x >= size.x || gid.y >= size.y) return;
 
-    imageStore(img_color_target, gid, vec4(0.1, 0.1, 0.1, 0.0));
+    imageStore(img_color_target, gid, vec4(0.0));
 }

@@ -1,0 +1,29 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer buff_radix_histogram {
+    uint histogram[];
+};
+
+layout(std430, set = 0, binding = 1) buffer buff_radix_cursor {
+    uint cursor[];
+};
+
+// sortRange[0] = ordered-float min key, sortRange[1] = ordered-float max key.
+// Ordered-float encoding lets atomicMin/atomicMax work correctly for signed floats.
+layout(std430, set = 0, binding = 2) buffer buff_sort_range {
+    uint sortRange[];
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    histogram[gid] = 0u;
+    cursor[gid] = 0u;
+
+    if (gid == 0u) {
+        sortRange[0] = 0xffffffffu;
+        sortRange[1] = 0u;
+    }
+}

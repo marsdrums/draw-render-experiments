@@ -1,0 +1,94 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#include "c74.noise.funcs.glsl"
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+};
+
+struct DrawParticle{
+    vec4 clipCenter;
+    vec4 lightClipCenter;
+    // x = radius, y = unused, z = inside flag, w = unused
+    vec4 data;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+// Sorted draw order. Values are indices into buff_particles.
+layout(std430, set = 0, binding = 1) readonly buffer buff_sorted_indices {
+    uint sortedIndices[];
+};
+
+layout(set = 0, binding = 2) uniform sampler2D img_shadow_map_prev;
+
+layout(std430, set = 0, binding = 3) writeonly buffer buff_particle_draw {
+    DrawParticle drawParticles[];
+};
+
+layout(set = 0, binding = 4) uniform Constants {
+    mat4 V;
+    mat4 P;
+    float ALPHA;
+};
+
+layout(binding = 5) uniform Cfg {
+    uint FIRST_INSTANCE;
+    uint COUNT;
+    uint TOTAL_COUNT;
+} pc;
+
+float samplePrevSliceOpacity(vec3 projCoords)
+{
+    if (projCoords.x < 0.0 || projCoords.x > 1.0 ||
+        projCoords.y < 0.0 || projCoords.y > 1.0 ||
+        projCoords.z > 1.0) {
+        return 1.0;
+    }
+
+    return texture(img_shadow_map_prev, projCoords.xy).r;
+}
+
+vec3 clipToTex(vec4 clipPos)
+{
+    vec3 projCoords = clipPos.xyz / clipPos.w;
+    projCoords.xy = projCoords.xy * 0.5 + 0.5;
+    projCoords.y = 1.0 - projCoords.y;
+    return projCoords;
+}
+
+void main()
+{
+    uint localIndex = gl_GlobalInvocationID.x;
+    if (localIndex >= pc.COUNT) return;
+
+    uint drawIndex = pc.FIRST_INSTANCE + localIndex;
+    if (drawIndex >= pc.TOTAL_COUNT) return;
+
+    uint particleIndex = sortedIndices[drawIndex];
+    Particle p = particles[particleIndex];
+
+    vec4 viewCenter = V * vec4(p.pos, 1.0);
+    vec4 clipCenter = P * viewCenter;
+
+    DrawParticle d;
+    d.clipCenter = clipCenter;
+    d.lightClipCenter = vec4(0.0);
+    d.data = vec4(p.rad, 0.0, 0.0, 0.0);
+
+    float prevSliceOpacity = samplePrevSliceOpacity(clipToTex(clipCenter));
+    if (prevSliceOpacity < 1.0) {
+        d.data.z = 1.0;
+    }
+
+    drawParticles[drawIndex] = d;
+}

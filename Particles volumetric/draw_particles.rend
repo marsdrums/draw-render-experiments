@@ -1,0 +1,86 @@
+#version 460
+
+#pragma stage(vertex)
+
+struct DrawParticle{
+    vec4 clipCenter;
+    vec4 lightClipCenter;
+    // x = radius, y = center shadow/light, z = inside flag, w = unused
+    vec4 data;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particle_draw {
+    DrawParticle drawParticles[];
+};
+
+layout(set = 0, binding = 1) uniform Constants {
+    mat4 V;
+    mat4 P;
+    mat4 ligV;
+    mat4 ligP;
+    vec3 lightDir;
+    float ALPHA;
+    float test;
+};
+
+layout(location = 0) in vec4 offset;
+
+layout(location = 0) out float shadow;
+layout(location = 1) out vec2 corner;
+layout(location = 2) out float inside;
+
+void main()
+{
+    DrawParticle d = drawParticles[gl_InstanceIndex];
+
+    corner = offset.xy;
+    shadow = d.data.y;
+    inside = d.data.z;
+
+    if (inside < 0.5) {
+        gl_Position = abs(d.clipCenter)*333 + vec4(1000.0);
+        return;
+    }
+
+    // The quad is camera-facing because offset.xy is applied directly in view
+    // space. Since projection is linear before perspective divide, only the two
+    // projection columns for x/y are needed per vertex. The center clip position
+    // was computed once per particle in comp_prepare_eye_particles.comp.
+    gl_Position = d.clipCenter + d.data.x * (offset.x * P[0] + offset.y * P[1]);
+}
+
+#pragma stage(fragment)
+
+layout(location = 0) in float shadow;
+layout(location = 1) in vec2 corner;
+layout(location = 2) in float inside;
+
+layout(location = 0) out vec4 fragColor;
+
+layout(set = 0, binding = 1) uniform Constants {
+    mat4 V;
+    mat4 P;
+    mat4 ligV;
+    mat4 ligP;
+    vec3 lightDir;
+    float ALPHA;
+};
+
+void main()
+{
+    float r2 = dot(corner, corner);
+
+    if (inside < 0.5 || r2 > 1.0) {
+        discard;
+        return;
+    }
+
+    vec3 alb = vec3(0.8, 0.3, 0.2);
+    vec3 ligCol = vec3(4,3,2);
+    float a = 1.0 - r2;
+    //a *= a;
+    //a *= ALPHA;
+    a = ALPHA * smoothstep(0.0, 1.0, a);
+    vec3 col = alb * ligCol * shadow;
+    fragColor = vec4(col * a, a); // pre-multiplied alpha
+}

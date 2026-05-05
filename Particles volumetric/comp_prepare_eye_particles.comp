@@ -1,0 +1,113 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+};
+
+struct DrawParticle{
+    vec4 clipCenter;
+    vec4 lightClipCenter;
+    // x = radius, y = center shadow/light, z = inside flag, w = unused
+    vec4 data;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+// Sorted draw order. Values are indices into buff_particles.
+layout(std430, set = 0, binding = 1) readonly buffer buff_sorted_indices {
+    uint sortedIndices[];
+};
+
+layout(set = 0, binding = 2) uniform sampler2D img_shadow_map;
+layout(set = 0, binding = 3) uniform sampler2D img_prev_slice;
+
+layout(std430, set = 0, binding = 4) writeonly buffer buff_particle_draw {
+    DrawParticle drawParticles[];
+};
+
+layout(set = 0, binding = 5) uniform Constants {
+    mat4 V;
+    mat4 P;
+    mat4 ligV;
+    mat4 ligP;
+    vec3 lightDir;
+    float ALPHA;
+    float test;
+};
+
+layout(binding = 6) uniform Cfg {
+    uint FIRST_INSTANCE;
+    uint COUNT;
+    uint TOTAL_COUNT;
+} pc;
+
+float samplePrevSliceOpacity(vec3 projCoords)
+{
+    if (projCoords.x < 0.0 || projCoords.x > 1.0 ||
+        projCoords.y < 0.0 || projCoords.y > 1.0 ||
+        projCoords.z > 1.0) {
+        return 1.0;
+    }
+
+    return texture(img_prev_slice, projCoords.xy).a;
+}
+
+float sampleShadow(vec3 projCoords, uint id)
+{
+    if (projCoords.x < 0.0 || projCoords.x > 1.0 ||
+        projCoords.y < 0.0 || projCoords.y > 1.0 ||
+        projCoords.z > 1.0) {
+        return 1.0;
+    }
+
+    float shadow = texture(img_shadow_map, projCoords.xy).r;
+    return clamp(1.0 - shadow, 0.0, 1.0);
+}
+
+vec3 clipToTex(vec4 clipPos)
+{
+    vec3 projCoords = clipPos.xyz / clipPos.w;
+    projCoords.xy = projCoords.xy * 0.5 + 0.5;
+    projCoords.y = 1.0 - projCoords.y;
+    return projCoords;
+}
+
+void main()
+{
+    uint localIndex = gl_GlobalInvocationID.x;
+    if (localIndex >= pc.COUNT) return;
+
+    uint drawIndex = pc.FIRST_INSTANCE + localIndex;
+    if (drawIndex >= pc.TOTAL_COUNT) return;
+
+    uint particleIndex = sortedIndices[drawIndex];
+    Particle p = particles[particleIndex];
+
+    vec4 viewCenter = V * vec4(p.pos, 1.0);
+    vec4 clipCenter = P * viewCenter;
+
+    float prevSliceOpacity = samplePrevSliceOpacity(clipToTex(clipCenter));
+
+    DrawParticle d;
+    d.clipCenter = clipCenter;
+    d.lightClipCenter = ligP * (ligV * vec4(p.pos, 1.0));
+    d.data = vec4(p.rad, 1.0, 0.0, 0.0);
+
+    if (prevSliceOpacity < 0.95) {
+        // Shadow is sampled once at the particle center and reused by all four
+        // billboard vertices/fragments through buff_particle_draw.
+        d.data.y = sampleShadow(clipToTex(d.lightClipCenter), p.id);
+        d.data.z = 1.0;
+    }
+
+    // drawParticles is addressed by sorted draw order, not original particle id.
+    drawParticles[drawIndex] = d;
+}

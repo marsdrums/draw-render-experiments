@@ -23,7 +23,6 @@ layout(binding = 1) uniform Cfg {
     uint SQRT_COUNT;
     float SCALE;
     vec3 HALF_VECTOR;
-    uint FLIPPED;
     float RADIUS;
 };
 
@@ -39,24 +38,17 @@ void main() {
     seed.y = float(gid / SQRT_COUNT) * SCALE;
     seed.z = TIME;
     
-    p.pos.x = Normalize(fBmA(seed,                    0.5, 2.0, 1., 6.));
-    p.pos.y = Normalize(fBmA(seed*2.5 + vec3(1,2,3)*100,  0.5, 2.0, 1., 6.));
+    p.pos.x = Normalize(fBmA(seed                  ,  0.5, 2.0, 1., 6.));
+    p.pos.y = Normalize(fBmA(seed + vec3(1,2,3)*100,  0.5, 2.0, 1., 6.));
     p.pos.z = Normalize(fBmA(seed + vec3(1,2,3)*200,  0.5, 2.0, 1., 6.));
-
-    p.pos.y = fract(p.pos.y + TIME);
 
     p.pos = p.pos*2 - 1;
 
     uint jittSeed = gid + 999u;
-    vec3 jittering = (RandomVec301(jittSeed) - 0.5)*0.03;
+    vec3 jittering = (RandomVec301(jittSeed) - 0.5)*0.01;
 
     p.pos += jittering;
 
-/*
-    p.pos.x = pnoise(seed,                      vec3(100.0));
-    p.pos.y = pnoise(seed + vec3(1,2,3)*100,    vec3(200.0));
-    p.pos.z = pnoise(seed + vec3(1,2,3)*200,    vec3(300.0));
-*/
     p.rad = RADIUS;
     p.col = vec4(sin(float(gid) * vec3(1,2,3))*0.5 + 0.5,1);
     p.id = gid;
