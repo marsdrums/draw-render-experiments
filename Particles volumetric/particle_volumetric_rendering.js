@@ -10,7 +10,7 @@ let ALPHA = 0.1;
 let pos, at, farClip, nearClip, lensAngle, viewDir;
 let sliceSize;
 let particleCount;
-let sliceCount = 32;
+let sliceCount = 128;
 
 // One-pass radix/counting sort settings.
 // The sort key range is measured on the GPU every frame, so particle positions
@@ -255,7 +255,7 @@ comp_composite_background.shader = "comp_composite_background.comp";
 comp_composite_background.workgroups = [Math.ceil(VIEWPORT[0] / 16), Math.ceil(VIEWPORT[1] / 16), 1];
 comp_composite_background.bind("img_color_target", img_color_target.name);
 
-count(100000);
+count(1000000);
 
 function camera_name(name) {
     proxy_camera.name = name;
