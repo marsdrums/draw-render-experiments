@@ -1,0 +1,117 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+#define DENSITY_WORD_COUNT 8u
+#define DENSITY_BITS_PER_WORD 32u
+#define DENSITY_SLICE_COUNT (DENSITY_WORD_COUNT * DENSITY_BITS_PER_WORD)
+
+struct DrawParticle{
+    vec4 clipCenter;
+    vec4 lightClipCenter;
+    // x = radius, y = center shadow/light, z = inside flag, w = unused
+    vec4 data;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particle_draw {
+    DrawParticle drawParticles[];
+};
+
+// 256-slice density map stored in one large 2D image:
+//   image width = shadowMapWidth * 8
+//   image height = shadowMapHeight
+//   tile 0: slices    0..31
+//   tile 1: slices   32..63
+//   tile 2: slices   64..95
+//   tile 3: slices   96..127
+//   tile 4: slices  128..159
+//   tile 5: slices  160..191
+//   tile 6: slices  192..223
+//   tile 7: slices  224..255
+layout(r32ui, binding = 1) uniform uimage2D img_density_map;
+
+layout(binding = 2) uniform Cfg{
+    uint COUNT;
+    uint SLICE_SIZE;
+    uint FLIPPED;
+    float ALPHA;
+    mat4 P;
+};
+
+ivec2 densityPixelCoord(ivec2 logicalPixel, uint wordIndex, ivec2 logicalSize)
+{
+    return ivec2(logicalPixel.x + int(wordIndex) * logicalSize.x, logicalPixel.y);
+}
+
+uint logicalSliceFromDrawIndex(uint drawOrderIndex)
+{
+    // drawOrderIndex is the compact order used by the single draw/compute pass.
+    // For flipped views, drawParticles[] has already been reordered to match the
+    // old sliced loop, so the first emitted particles belong to logical slice 0.
+    if (SLICE_SIZE == 0u || FLIPPED == 0u) {
+        return min(DENSITY_SLICE_COUNT - 1u, drawOrderIndex / max(SLICE_SIZE, 1u));
+    }
+
+    uint actualSliceCount = (COUNT + SLICE_SIZE - 1u) / SLICE_SIZE;
+    actualSliceCount = clamp(actualSliceCount, 1u, DENSITY_SLICE_COUNT);
+
+    uint lastPhysicalSlice = actualSliceCount - 1u;
+    uint lastSliceStart = lastPhysicalSlice * SLICE_SIZE;
+    uint lastSliceCount = COUNT - lastSliceStart;
+
+    if (drawOrderIndex < lastSliceCount) {
+        return 0u;
+    }
+
+    uint remaining = drawOrderIndex - lastSliceCount;
+    return min(DENSITY_SLICE_COUNT - 1u, 1u + remaining / SLICE_SIZE);
+}
+
+void main() {
+
+    uint gid = gl_GlobalInvocationID.x;
+    if(gid >= COUNT) return;
+
+    ivec2 fullSize = imageSize(img_density_map);
+    ivec2 logicalSize = ivec2(fullSize.x / int(DENSITY_WORD_COUNT), fullSize.y);
+    vec2 fsize = vec2(logicalSize);
+
+    DrawParticle p = drawParticles[gid];
+
+    uint slice = logicalSliceFromDrawIndex(gid);
+    uint wordIndex = slice / DENSITY_BITS_PER_WORD;   // 0..7
+    uint bitIndex  = slice & 31u;                     // 0..31
+    uint value = 1u << bitIndex;
+
+    float rad = p.data.x;
+    vec4 a = P[0] * rad;
+    vec4 b = P[1] * rad;
+
+    vec4 pos00 = p.clipCenter + (-a + -b);
+    vec4 pos11 = p.clipCenter + ( a +  b);
+
+    vec2 uv00 = pos00.xy / pos00.w;
+    vec2 uv11 = pos11.xy / pos11.w;
+
+    uv00 = uv00 * 0.5 + 0.5;
+    uv11 = uv11 * 0.5 + 0.5;
+
+    uv00.y = 1.0 - uv00.y;
+    uv11.y = 1.0 - uv11.y;
+
+    vec2 pmin = min(uv00, uv11) * fsize;
+    vec2 pmax = max(uv00, uv11) * fsize;
+
+    int x0 = max(0, int(floor(pmin.x)));
+    int y0 = max(0, int(floor(pmin.y)));
+    int x1 = min(logicalSize.x, int(ceil(pmax.x)));
+    int y1 = min(logicalSize.y, int(ceil(pmax.y)));
+
+    for(int x = x0; x < x1; x++){
+    for(int y = y0; y < y1; y++){
+        ivec2 logicalPixel = ivec2(x, y);
+        ivec2 tiledPixel = densityPixelCoord(logicalPixel, wordIndex, logicalSize);
+        imageAtomicOr(img_density_map, tiledPixel, value);
+    }
+    }
+}

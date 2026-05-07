@@ -1,0 +1,96 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#include "c74.noise.funcs.glsl"
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+};
+
+struct DrawParticle{
+    vec4 clipCenter;
+    vec4 lightClipCenter;
+    // x = radius, y = unused, z = inside flag, w = unused
+    vec4 data;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+// Sorted draw order. Values are indices into buff_particles.
+layout(std430, set = 0, binding = 1) readonly buffer buff_sorted_indices {
+    uint sortedIndices[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer buff_particle_draw {
+    DrawParticle drawParticles[];
+};
+
+layout(set = 0, binding = 3) uniform Constants {
+    mat4 VP;
+    float ALPHA;
+};
+
+layout(binding = 4) uniform Cfg {
+    uint COUNT;
+    uint SLICE_SIZE;
+    uint FLIPPED;
+} pc;
+
+
+#define DENSITY_WORD_COUNT 8u
+#define DENSITY_BITS_PER_WORD 32u
+#define DENSITY_SLICE_COUNT (DENSITY_WORD_COUNT * DENSITY_BITS_PER_WORD)
+
+uint sortedIndexFromDrawOrder(uint drawOrderIndex)
+{
+    // Converts compact one-pass render order back to an index into sortedIndices[].
+    // This preserves the exact slice traversal order of the previous sliced loop.
+    if (pc.SLICE_SIZE == 0u || pc.FLIPPED == 0u) {
+        return drawOrderIndex;
+    }
+
+    uint actualSliceCount = (pc.COUNT + pc.SLICE_SIZE - 1u) / pc.SLICE_SIZE;
+    actualSliceCount = clamp(actualSliceCount, 1u, DENSITY_SLICE_COUNT);
+
+    uint lastPhysicalSlice = actualSliceCount - 1u;
+    uint lastSliceStart = lastPhysicalSlice * pc.SLICE_SIZE;
+    uint lastSliceCount = pc.COUNT - lastSliceStart;
+
+    if (drawOrderIndex < lastSliceCount) {
+        return lastSliceStart + drawOrderIndex;
+    }
+
+    uint remaining = drawOrderIndex - lastSliceCount;
+    uint logicalSliceAfterLast = remaining / pc.SLICE_SIZE;
+    uint inSlice = remaining - logicalSliceAfterLast * pc.SLICE_SIZE;
+    uint physicalSlice = lastPhysicalSlice - 1u - logicalSliceAfterLast;
+
+    return physicalSlice * pc.SLICE_SIZE + inSlice;
+}
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.COUNT) return;
+
+    uint sortedIndex = sortedIndexFromDrawOrder(gid);
+
+    uint particleIndex = sortedIndices[sortedIndex];
+    Particle p = particles[particleIndex];
+
+    vec4 clipCenter = VP * vec4(p.pos, 1.0);
+
+    DrawParticle d;
+    d.clipCenter = clipCenter;
+    d.lightClipCenter = vec4(0.0);
+    d.data = vec4(p.rad, 0.0, 1.0, 0.0);
+    drawParticles[gid] = d;
+}

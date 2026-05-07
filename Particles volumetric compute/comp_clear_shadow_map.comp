@@ -1,0 +1,15 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(r32ui, binding = 0) uniform writeonly uimage2D img_density_map;
+
+void main() {
+
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(img_density_map);
+
+    if (gid.x >= size.x || gid.y >= size.y) return;
+
+    imageStore(img_density_map, gid, uvec4(0u));
+}

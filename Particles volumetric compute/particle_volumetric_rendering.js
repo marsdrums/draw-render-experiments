@@ -10,7 +10,9 @@ let ALPHA = 0.1;
 let pos, at, farClip, nearClip, lensAngle, viewDir;
 let sliceSize;
 let particleCount;
-let sliceCount = 128;
+let sliceCount = 256;
+let scale = 0.0006;
+let shadowMapSize = 1024;
 
 // One-pass radix/counting sort settings.
 // The sort key range is measured on the GPU every frame, so particle positions
@@ -43,25 +45,6 @@ mat_quad.setcell(2, "val", [-1, +1, 0, 0]);
 mat_quad.setcell(3, "val", [+1, +1, 0, 0]);
 buff_quad.jit_matrix(mat_quad.name);
 
-let buff_slice = new JitterObject("jit.gpu.buffer");
-buff_slice.bytecount = 4 * 4;
-
-let comp_set_slice = new JitterObject("jit.gpu.compute");
-comp_set_slice.shader = "comp_set_slice.comp";
-comp_set_slice.workgroups = [1,1,1];
-comp_set_slice.bind("buff_slice", buff_slice.name);
-
-let buff_inside_counter = new JitterObject("jit.gpu.buffer"); // indirect draw args / visible count
-buff_inside_counter.bytecount = 4 * 4;
-
-let buff_inside = new JitterObject("jit.gpu.buffer"); // per-particle visibility flag, kept for compatibility
-let buff_visible_indices = new JitterObject("jit.gpu.buffer"); // kept for compatibility
-
-let comp_reset_inside_counter = new JitterObject("jit.gpu.compute");
-comp_reset_inside_counter.file = "comp_reset_inside_counter.comp";
-comp_reset_inside_counter.workgroups = [1, 1, 1];
-comp_reset_inside_counter.bind("buff_inside_counter", buff_inside_counter.name);
-
 let comp_generate_position = new JitterObject("jit.gpu.compute");
 comp_generate_position.file = "comp_generate_position.comp";
 comp_generate_position.bind("buff_particles", buff_particles.name);
@@ -69,7 +52,6 @@ comp_generate_position.param("RADIUS", RADIUS);
 
 // -----------------------------------------------------------------------------
 // Fast GPU radix/counting sort pipeline for arbitrary particle counts.
-// Replaces the previous O(n log^2 n) bitonic merge path.
 //
 // This version sorts only particle indices. buff_particles stays in generated
 // order, while buff_sorted_indices contains the current sorted permutation.
@@ -139,26 +121,14 @@ let img_color_target = new JitterObject("jit.gpu.image");
 img_color_target.dim = [VIEWPORT[0], VIEWPORT[1]];
 img_color_target.format = "rgba32_float";
 
-let shadowMapSize = 512;
-const SHADOW_BLUR_LOCAL_SIZE = 128;
-
-let img_shadow_map = new JitterObject("jit.gpu.image");
-img_shadow_map.dim = [shadowMapSize, shadowMapSize];
-img_shadow_map.format = "r32_float";
-
-let img_shadow_map_prev = new JitterObject("jit.gpu.image");
-img_shadow_map_prev.dim = [shadowMapSize, shadowMapSize];
-img_shadow_map_prev.format = "r32_float";
-
-let img_shadow_map_next = new JitterObject("jit.gpu.image");
-img_shadow_map_next.dim = [shadowMapSize, shadowMapSize];
-img_shadow_map_next.format = "r32_float";
-
-// Ping-pong target for the separable shadow-map Gaussian blur.
-// Horizontal blur writes here; vertical blur writes back into img_shadow_map.
-let img_shadow_map_tmp = new JitterObject("jit.gpu.image");
-img_shadow_map_tmp.dim = [shadowMapSize, shadowMapSize];
-img_shadow_map_tmp.format = "r32_float";
+let img_density_map = new JitterObject("jit.gpu.image");
+// 256-slice occupancy map stored as eight horizontal r32ui tiles.
+// Tile 0 stores slices    0..31, tile 1 stores   32..63,
+// tile 2 stores slices   64..95, tile 3 stores   96..127,
+// tile 4 stores slices 128..159, tile 5 stores 160..191,
+// tile 6 stores slices 192..223, tile 7 stores 224..255.
+img_density_map.dim = [shadowMapSize * 8, shadowMapSize];
+img_density_map.format = "r32_uint";
 
 let comp_clear_color_target = new JitterObject("jit.gpu.compute");
 comp_clear_color_target.shader = "comp_clear_color_target.comp";
@@ -167,69 +137,29 @@ comp_clear_color_target.workgroups = [Math.ceil(VIEWPORT[0] / 16), Math.ceil(VIE
 
 let comp_clear_shadow_map = new JitterObject("jit.gpu.compute");
 comp_clear_shadow_map.shader = "comp_clear_shadow_map.comp";
-comp_clear_shadow_map.bind("img_shadow_map", img_shadow_map.name);
-comp_clear_shadow_map.workgroups = [Math.ceil(shadowMapSize / 16), Math.ceil(shadowMapSize / 16), 1];
+comp_clear_shadow_map.bind("img_density_map", img_density_map.name);
+comp_clear_shadow_map.workgroups = [Math.ceil((shadowMapSize * 8) / 16), Math.ceil(shadowMapSize / 16), 1];
 
-// -----------------------------------------------------------------------------
-// High-performance separable Gaussian blur for the accumulated shadow map.
-// Each pass uses shared memory with halo pixels, so each source texel is loaded
-// once per tile instead of once per tap. The result of blur_shadow_map() is back
-// in img_shadow_map, so the existing particle shader keeps sampling the same name.
-// -----------------------------------------------------------------------------
-let comp_shadow_blur_h = new JitterObject("jit.gpu.compute");
-comp_shadow_blur_h.shader = "comp_shadow_blur_h.comp";
-comp_shadow_blur_h.bind("img_src", img_shadow_map.name);
-comp_shadow_blur_h.bind("img_dst", img_shadow_map_tmp.name);
-comp_shadow_blur_h.workgroups = [Math.ceil(shadowMapSize / SHADOW_BLUR_LOCAL_SIZE), shadowMapSize, 1];
-
-let comp_shadow_blur_v = new JitterObject("jit.gpu.compute");
-comp_shadow_blur_v.shader = "comp_shadow_blur_v.comp";
-comp_shadow_blur_v.bind("img_src", img_shadow_map_tmp.name);
-comp_shadow_blur_v.bind("img_dst", img_shadow_map.name);
-comp_shadow_blur_v.workgroups = [shadowMapSize, Math.ceil(shadowMapSize / SHADOW_BLUR_LOCAL_SIZE), 1];
-
-// -----------------------------------------------------------------------------
-// Per-slice particle preparation.
-//  - transform particle center to clip space
-//  - sample previous eye/shadow slice for opacity culling
-//  - sample the light buffer for eye-pass shadowing
-// The vertex shaders then only add a cheap projected x/y billboard offset.
-// -----------------------------------------------------------------------------
 let comp_prepare_eye_particles = new JitterObject("jit.gpu.compute");
 comp_prepare_eye_particles.shader = "comp_prepare_eye_particles.comp";
 comp_prepare_eye_particles.bind("buff_particles", buff_particles.name);
 comp_prepare_eye_particles.bind("buff_sorted_indices", buff_sorted_indices.name);
-comp_prepare_eye_particles.bind("img_shadow_map", img_shadow_map.name);
-comp_prepare_eye_particles.bind("img_prev_slice", img_color_target.name);
+comp_prepare_eye_particles.bind("img_density_map", img_density_map.name);
 comp_prepare_eye_particles.bind("buff_particle_draw", buff_particle_draw.name);
 
 let comp_prepare_shadow_particles = new JitterObject("jit.gpu.compute");
 comp_prepare_shadow_particles.shader = "comp_prepare_shadow_particles.comp";
 comp_prepare_shadow_particles.bind("buff_particles", buff_particles.name);
 comp_prepare_shadow_particles.bind("buff_sorted_indices", buff_sorted_indices.name);
-comp_prepare_shadow_particles.bind("img_shadow_map_prev", img_shadow_map_prev.name);
 comp_prepare_shadow_particles.bind("buff_particle_draw", buff_particle_draw.name);
 
 // shadow pass
 
-let draw_shadow = new JitterObject("jit.gpu.draw");
-draw_shadow.shader = "draw_shadow.rend";
-draw_shadow.vb0 = buff_quad.name;
-draw_shadow.buff_particle_draw = buff_particle_draw.name;
-draw_shadow.indirect = buff_slice.name;
-draw_shadow.topology = "trianglestrip";
-draw_shadow.elemcount = 4;
-draw_shadow.blendenable = true;
-draw_shadow.depth_write = false;
-draw_shadow.param("ALPHA", ALPHA);
-
-let render_shadow = new JitterObject("jit.gpu.render");
-render_shadow.colorattachments = 1;
-render_shadow.depth = false;
-render_shadow.depthimg = img_shadow_map.name;
-render_shadow.colorimg0 = img_shadow_map.name;
-render_shadow.clearcolor0 = [0, 0, 0, 0];
-render_shadow.colorloadop0 = "load";
+let comp_render_shadow = new JitterObject("jit.gpu.compute");
+comp_render_shadow.shader = "comp_render_shadow.comp";
+comp_render_shadow.bind("buff_particle_draw", buff_particle_draw.name);
+comp_render_shadow.bind("img_density_map", img_density_map.name);
+comp_render_shadow.param("ALPHA", ALPHA);
 
 // main pass
 
@@ -237,12 +167,15 @@ let draw_particles = new JitterObject("jit.gpu.draw");
 draw_particles.shader = "draw_particles.rend";
 draw_particles.vb0 = buff_quad.name;
 draw_particles.buff_particle_draw = buff_particle_draw.name;
-draw_particles.indirect = buff_slice.name;
 draw_particles.topology = "trianglestrip";
 draw_particles.elemcount = 4;
 draw_particles.blendenable = true;
 draw_particles.depth_write = false;
 draw_particles.param("ALPHA", ALPHA);
+draw_particles.blendcolorsrc = "inv_dst_alpha";
+draw_particles.blendcolordst = "one";
+draw_particles.blendalphasrc = "inv_dst_alpha";
+draw_particles.blendalphadst = "one";
 
 let render_particles = new JitterObject("jit.gpu.render");
 render_particles.colorattachments = 1;
@@ -263,8 +196,8 @@ function camera_name(name) {
 
 function setalpha(x){
     ALPHA = x;
-    draw_shadow.param("ALPHA", ALPHA);
     draw_particles.param("ALPHA", ALPHA);
+    comp_render_shadow.param("ALPHA", ALPHA);
 }
 
 function setradius(x){
@@ -273,8 +206,12 @@ function setradius(x){
 }
 
 function setslice_count(x){
-    sliceCount = x;
+    sliceCount = Math.max(1, Math.min(256, x));
     count(particleCount);
+}
+
+function setscale(x){
+    scale = x;
 }
 
 // VECTOR MATH
@@ -327,9 +264,6 @@ function count(N) {
     buff_sorted_indices.bytecount = Math.max(1, particleCount) * SIZE_OF_UINT;
     buff_particle_draw.bytecount = Math.max(1, particleCount) * 48;
 
-    buff_inside.bytecount = Math.max(1, particleCount) * SIZE_OF_UINT;
-    buff_visible_indices.bytecount = Math.max(1, particleCount) * SIZE_OF_UINT;
-
     buff_radix_histogram.bytecount = RADIX_BINS * SIZE_OF_UINT;
     buff_radix_cursor.bytecount = RADIX_BINS * SIZE_OF_UINT;
     buff_radix_bin_offsets.bytecount = RADIX_BINS * SIZE_OF_UINT;
@@ -349,10 +283,19 @@ function count(N) {
     comp_radix_scatter_particles.workgroups = [Math.max(1, Math.ceil(particleCount / 256)), 1, 1];
     comp_radix_scatter_particles.param("COUNT", particleCount);
 
-    draw_particles.instancecount = Math.ceil(particleCount / sliceCount);
-    draw_shadow.instancecount = Math.ceil(particleCount / sliceCount);
-
     sliceSize = Math.ceil(particleCount / sliceCount);
+
+    comp_render_shadow.param("COUNT", particleCount);
+    comp_render_shadow.param("SLICE_SIZE", sliceSize);
+    comp_render_shadow.workgroups = [Math.ceil(particleCount / 256), 1, 1];
+
+    comp_prepare_eye_particles.param("pc.SLICE_SIZE", sliceSize);
+    comp_prepare_shadow_particles.param("pc.SLICE_SIZE", sliceSize);
+
+    comp_prepare_eye_particles.workgroups = [Math.max(1, Math.ceil(particleCount / 256)), 1, 1];
+    comp_prepare_shadow_particles.workgroups = [Math.max(1, Math.ceil(particleCount / 256)), 1, 1];
+
+    draw_particles.instancecount = particleCount;
 }
 
 function time(T) {
@@ -372,25 +315,27 @@ function calc_matrices() {
 
     let lightPos = new Float32Array([-lightDir[0] * 3, -lightDir[1] * 3, -lightDir[2] * 3]);
 
-    return {
+
+    let matrices = {
         V: m.lookAt(pos, at, up),
         P: m.perspective(lensAngle, RATIO, nearClip, farClip),
         ligV: m.lookAt(lightPos, [0,0,0], up),
         ligP: m.ortho(-1.5, 1.5, -1.5, 1.5, 0.1, 30)
     };
+
+    matrices.VP = m.mulMat4(matrices.P, matrices.V);
+    matrices.ligVP = m.mulMat4(matrices.ligP, matrices.ligV);
+    return matrices;
 }
 
 function sort_particles(){
-    if (particleCount <= 0) return;
 
     comp_radix_clear.bang();
 
     // Measure the actual min/max key for this frame before quantizing to bins.
-    // This removes the old fixed [-1.8, +1.8] sort range limitation.
     comp_radix_find_key_range.bang();
 
     comp_radix_build_histogram.bang();
-
     comp_radix_scan_bins.bang();
     comp_radix_scan_block_sums.bang();
     comp_radix_add_block_offsets.bang();
@@ -405,93 +350,53 @@ function clear_color_attachments(){
     comp_clear_shadow_map.bang();
 }
 
-function blur_shadow_map(){
-    comp_shadow_blur_h.bang();
-    comp_shadow_blur_v.bang();
-}
-
-function prepare_eye_particles(firstInstance, count, matrices, sliceProgress) {
-    comp_prepare_eye_particles.workgroups = [Math.max(1, Math.ceil(count / 256)), 1, 1];
-    comp_prepare_eye_particles.param("V", matrices.V);
-    comp_prepare_eye_particles.param("P", matrices.P);
-    comp_prepare_eye_particles.param("ligV", matrices.ligV);
-    comp_prepare_eye_particles.param("ligP", matrices.ligP);
+function prepare_eye_particles(matrices) {
+    comp_prepare_eye_particles.param("VP", matrices.VP);
+    comp_prepare_eye_particles.param("ligVP", matrices.ligVP);
     comp_prepare_eye_particles.param("lightDir", lightDir);
     comp_prepare_eye_particles.param("ALPHA", ALPHA);
-    comp_prepare_eye_particles.param("test", sliceProgress);
-    comp_prepare_eye_particles.param("pc.FIRST_INSTANCE", firstInstance);
-    comp_prepare_eye_particles.param("pc.COUNT", count);
-    comp_prepare_eye_particles.param("pc.TOTAL_COUNT", particleCount);
+    comp_prepare_eye_particles.param("pc.COUNT", particleCount);
+    comp_prepare_eye_particles.param("pc.SLICE_SIZE", sliceSize);
+    comp_prepare_eye_particles.param("pc.FLIPPED", flipped ? 1 : 0);
     comp_prepare_eye_particles.bang();
 }
 
-function prepare_shadow_particles(firstInstance, count, matrices) {
-    comp_prepare_shadow_particles.workgroups = [Math.max(1, Math.ceil(count / 256)), 1, 1];
-    comp_prepare_shadow_particles.param("V", matrices.ligV);
-    comp_prepare_shadow_particles.param("P", matrices.ligP);
+function prepare_shadow_particles(matrices) {
+    comp_prepare_shadow_particles.param("VP", matrices.ligVP);
     comp_prepare_shadow_particles.param("ALPHA", ALPHA);
-    comp_prepare_shadow_particles.param("pc.FIRST_INSTANCE", firstInstance);
-    comp_prepare_shadow_particles.param("pc.COUNT", count);
-    comp_prepare_shadow_particles.param("pc.TOTAL_COUNT", particleCount);
+    comp_prepare_shadow_particles.param("pc.COUNT", particleCount);
+    comp_prepare_shadow_particles.param("pc.FLIPPED", flipped ? 1 : 0);
     comp_prepare_shadow_particles.bang();
 }
 
 function bang() {
 
     let transfrom = calc_matrices();
+
     compute_half_vector();
 
-    draw_particles.blendcolorsrc = "inv_dst_alpha";
-    draw_particles.blendcolordst = "one";
-    draw_particles.blendalphasrc = "inv_dst_alpha";
-    draw_particles.blendalphadst = "one";
-
     comp_generate_position.param("TIME", TIME*0.1);
-    comp_generate_position.param("SCALE", 0.0002);
+    comp_generate_position.param("SCALE", scale);
     comp_generate_position.param("HALF_VECTOR", halfVector);
     comp_generate_position.bang();
 
     sort_particles();
 
+    clear_color_attachments();
+
+    prepare_shadow_particles(transfrom);
+    comp_render_shadow.param("P", transfrom.ligP);
+    comp_render_shadow.param("FLIPPED", flipped ? 1 : 0);
+    comp_render_shadow.bang();
+
+    prepare_eye_particles(transfrom);
     draw_particles.param("V", transfrom.V);
     draw_particles.param("P", transfrom.P);
     draw_particles.param("ligV", transfrom.ligV);
     draw_particles.param("ligP", transfrom.ligP);
     draw_particles.param("lightDir", lightDir);
-    draw_shadow.param("V", transfrom.ligV);
-    draw_shadow.param("P", transfrom.ligP);
-
-    clear_color_attachments();
-
-    // Sliced rendering. buff_sorted_indices is ascending in half-vector depth;
-    for (let si = 0; si < sliceCount; si++) {
-        let i = flipped ? (sliceCount - 1 - si) : si;
-        let offset = sliceSize * i;
-
-        let count = Math.min(particleCount, offset + sliceSize) - offset;
-        if (count <= 0) continue;
-
-        comp_set_slice.param("pc.instanceCount", count);
-        comp_set_slice.param("pc.firstInstance", offset);
-        comp_set_slice.bang();
-
-        // Eye pass: prepare center-based opacity/shadow once per particle, then
-        // draw the 4 quad vertices using the cached per-particle data.
-        prepare_eye_particles(offset, count, transfrom, si / sliceCount);
-        draw_particles.param("test", si / sliceCount);
-        render_particles.jit_gpu_draw(draw_particles.name);
-        render_particles.bang();
-
-        if(si < sliceCount - 1){ //skip the last iteration
-            // Shadow pass: same idea, but in light clip space.
-            prepare_shadow_particles(offset, count, transfrom);
-            render_shadow.jit_gpu_draw(draw_shadow.name);
-            render_shadow.bang();
-
-            // Blur the accumulated light buffer before the next eye pass samples it
-            blur_shadow_map();          
-        }
-    }
+    render_particles.jit_gpu_draw(draw_particles.name);
+    render_particles.bang();
 
     //composite background
     comp_composite_background.param("background", [0.2, 0.25, 0.4, 0.0]);

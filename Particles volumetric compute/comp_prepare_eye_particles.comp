@@ -1,0 +1,223 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+#define DENSITY_WORD_COUNT 8u
+#define DENSITY_BITS_PER_WORD 32u
+#define DENSITY_SLICE_COUNT (DENSITY_WORD_COUNT * DENSITY_BITS_PER_WORD)
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+};
+
+struct DrawParticle{
+    vec4 clipCenter;
+    vec4 lightClipCenter;
+    // x = radius, y = center shadow/light, z = inside flag, w = unused
+    vec4 data;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+// Sorted draw order. Values are indices into buff_particles.
+layout(std430, set = 0, binding = 1) readonly buffer buff_sorted_indices {
+    uint sortedIndices[];
+};
+
+// 256-slice density map stored in one large 2D image:
+//   image width = shadowMapWidth * 8
+//   image height = shadowMapHeight
+//   tile 0: slices    0..31
+//   tile 1: slices   32..63
+//   tile 2: slices   64..95
+//   tile 3: slices   96..127
+//   tile 4: slices  128..159
+//   tile 5: slices  160..191
+//   tile 6: slices  192..223
+//   tile 7: slices  224..255
+layout(r32ui, binding = 2) uniform uimage2D img_density_map;
+
+layout(std430, set = 0, binding = 3) writeonly buffer buff_particle_draw {
+    DrawParticle drawParticles[];
+};
+
+layout(set = 0, binding = 4) uniform Constants {
+    mat4 VP;
+    mat4 ligVP;
+    vec3 lightDir;
+    float ALPHA;
+};
+
+layout(binding = 5) uniform Cfg {
+    uint COUNT;
+    uint SLICE_SIZE;
+    uint FLIPPED;
+} pc;
+
+ivec2 densityPixelCoord(ivec2 logicalPixel, uint wordIndex, ivec2 logicalSize)
+{
+    return ivec2(logicalPixel.x + int(wordIndex) * logicalSize.x, logicalPixel.y);
+}
+
+uint loadDensityWord(ivec2 logicalPixel, uint wordIndex, ivec2 logicalSize)
+{
+    ivec2 tiledPixel = densityPixelCoord(logicalPixel, wordIndex, logicalSize);
+    return imageLoad(img_density_map, tiledPixel).x;
+}
+
+uint logicalSliceFromDrawIndex(uint drawOrderIndex)
+{
+    // drawOrderIndex is the compact one-pass rendering order: 0..TOTAL_COUNT-1.
+    // When not flipped, it matches the sorted-index order directly.
+    // When flipped, it matches the original sliced loop exactly:
+    //   last physical slice first, then next-to-last, ...
+    // The last physical slice may be partial, so it must be handled separately.
+    if (pc.SLICE_SIZE == 0u || pc.FLIPPED == 0u) {
+        return min(DENSITY_SLICE_COUNT - 1u, drawOrderIndex / max(pc.SLICE_SIZE, 1u));
+    }
+
+    uint actualSliceCount = (pc.COUNT + pc.SLICE_SIZE - 1u) / pc.SLICE_SIZE;
+    actualSliceCount = clamp(actualSliceCount, 1u, DENSITY_SLICE_COUNT);
+
+    uint lastPhysicalSlice = actualSliceCount - 1u;
+    uint lastSliceStart = lastPhysicalSlice * pc.SLICE_SIZE;
+    uint lastSliceCount = pc.COUNT - lastSliceStart;
+
+    if (drawOrderIndex < lastSliceCount) {
+        return 0u;
+    }
+
+    uint remaining = drawOrderIndex - lastSliceCount;
+    return min(DENSITY_SLICE_COUNT - 1u, 1u + remaining / pc.SLICE_SIZE);
+}
+
+uint sortedIndexFromDrawOrder(uint drawOrderIndex)
+{
+    // Converts compact one-pass render order back to an index into sortedIndices[].
+    // This preserves the exact slice traversal order of the previous sliced loop.
+    if (pc.SLICE_SIZE == 0u || pc.FLIPPED == 0u) {
+        return drawOrderIndex;
+    }
+
+    uint actualSliceCount = (pc.COUNT + pc.SLICE_SIZE - 1u) / pc.SLICE_SIZE;
+    actualSliceCount = clamp(actualSliceCount, 1u, DENSITY_SLICE_COUNT);
+
+    uint lastPhysicalSlice = actualSliceCount - 1u;
+    uint lastSliceStart = lastPhysicalSlice * pc.SLICE_SIZE;
+    uint lastSliceCount = pc.COUNT - lastSliceStart;
+
+    if (drawOrderIndex < lastSliceCount) {
+        return lastSliceStart + drawOrderIndex;
+    }
+
+    uint remaining = drawOrderIndex - lastSliceCount;
+    uint logicalSliceAfterLast = remaining / pc.SLICE_SIZE;
+    uint inSlice = remaining - logicalSliceAfterLast * pc.SLICE_SIZE;
+    uint physicalSlice = lastPhysicalSlice - 1u - logicalSliceAfterLast;
+
+    return physicalSlice * pc.SLICE_SIZE + inSlice;
+}
+
+uint countPreviousBitsIn256Slices(ivec2 logicalPixel, uint eyeSlice, ivec2 logicalSize)
+{
+    // eyeSlice N is shadowed by all occupied shadow slices [0, N - 1].
+    if (eyeSlice == 0u) return 0u;
+
+    eyeSlice = min(eyeSlice, DENSITY_SLICE_COUNT - 1u);
+
+    uint currentWord = eyeSlice / DENSITY_BITS_PER_WORD; // 0..7
+    uint bitInWord   = eyeSlice & 31u;                   // 0..31
+
+    uint density = 0u;
+
+    // Full 32-bit chunks that are entirely before the current eye slice.
+    for (uint word = 0u; word < currentWord; ++word) {
+        density += bitCount(loadDensityWord(logicalPixel, word, logicalSize));
+    }
+
+    // Partial chunk containing the current eye slice. Count only bits below it.
+    if (bitInWord > 0u) {
+        uint wordBits = loadDensityWord(logicalPixel, currentWord, logicalSize);
+        uint previousBitsMask = (1u << bitInWord) - 1u;
+        density += bitCount(wordBits & previousBitsMask);
+    }
+
+    return density;
+}
+
+float sampleShadow(vec3 projCoords, uint slice, vec2 offset)
+{
+    projCoords.xy += offset;
+
+    if (projCoords.x < 0.0 || projCoords.x > 1.0 ||
+        projCoords.y < 0.0 || projCoords.y > 1.0 ||
+        projCoords.z > 1.0) {
+        return 1.0;
+    }
+
+    ivec2 fullSize = imageSize(img_density_map);
+    ivec2 logicalSize = ivec2(fullSize.x / int(DENSITY_WORD_COUNT), fullSize.y);
+    vec2 fsize = vec2(logicalSize);
+
+    ivec2 logicalPixel = ivec2(fsize * projCoords.xy);
+    logicalPixel = clamp(logicalPixel, ivec2(0), logicalSize - ivec2(1));
+
+    uint density = countPreviousBitsIn256Slices(logicalPixel, slice, logicalSize);
+    return float(density);
+
+    //return clamp(1.0 - float(density) * ALPHA * 0.5, 0.0, 1.0);
+}
+
+vec3 clipToTex(vec4 clipPos)
+{
+    vec3 projCoords = clipPos.xyz / clipPos.w;
+    projCoords.xy = projCoords.xy * 0.5 + 0.5;
+    projCoords.y = 1.0 - projCoords.y;
+    return projCoords;
+}
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.COUNT) return;
+
+    uint sortedIndex = sortedIndexFromDrawOrder(gid);
+
+    uint slice = logicalSliceFromDrawIndex(gid);
+
+    uint particleIndex = sortedIndices[sortedIndex];
+    Particle p = particles[particleIndex];
+
+    vec4 clipCenter = VP * vec4(p.pos, 1.0);
+
+    DrawParticle d;
+    d.clipCenter = clipCenter;
+    d.lightClipCenter = ligVP * vec4(p.pos, 1.0);
+    d.data = vec4(p.rad, 1.0, 0.0, 0.0);
+    const float eps = 0.02 * float(slice + 1u) * 0.001;
+
+    vec3 uv = clipToTex(d.lightClipCenter);
+    d.data.y =  sampleShadow(uv, slice, vec2(0.0,  0.0)) * 0.25;
+    d.data.y += sampleShadow(uv, slice, vec2(-eps, 0.0)) * 0.125;
+    d.data.y += sampleShadow(uv, slice, vec2(+eps, 0.0)) * 0.125;
+    d.data.y += sampleShadow(uv, slice, vec2(0.0, -eps)) * 0.125;
+    d.data.y += sampleShadow(uv, slice, vec2(0.0, +eps)) * 0.125;
+    d.data.y += sampleShadow(uv, slice, vec2(-eps,-eps)) * 0.0625;
+    d.data.y += sampleShadow(uv, slice, vec2(+eps,+eps)) * 0.0625;
+    d.data.y += sampleShadow(uv, slice, vec2(-eps,+eps)) * 0.0625;
+    d.data.y += sampleShadow(uv, slice, vec2(-eps,-eps)) * 0.0625;
+    d.data.y = exp(-d.data.y * ALPHA * 0.4);
+    d.data.z = 1.0;
+
+    // drawParticles is addressed by compact render order, not original particle id.
+    // For flipped views, sortedIndexFromDrawOrder() reverses the slice order while
+    // this write remains compact, so the single indirect draw emits the same order
+    // as the old per-slice loop.
+    drawParticles[gid] = d;
+}
