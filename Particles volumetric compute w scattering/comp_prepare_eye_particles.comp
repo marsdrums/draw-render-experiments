@@ -1,0 +1,324 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "c74.noise.funcs.glsl"
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+    vec2    _pad0;
+    vec3    prevPos;
+    float   _pad1;
+};
+
+struct DrawParticle{
+    vec4 clipCenter;
+    vec4 prevClipCenter;
+    vec4 lightClipCenter;
+    // x = radius, y = center shadow/light, z = inside flag, w = ambient visibility
+    vec4 data;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+// Sorted draw order. Values are indices into buff_particles.
+layout(std430, set = 0, binding = 1) readonly buffer buff_sorted_indices {
+    uint sortedIndices[];
+};
+
+// Slice occupancy map. Width is tiled by 32-bit words; each bit is one light-space slice.
+layout(r32ui, binding = 2) uniform uimage2D img_density_map;
+
+// Same tiling as img_density_map. Each word stores the number of occupied
+// slices in all previous 32-bit words for that logical shadow-map pixel.
+layout(r32ui, binding = 8) uniform uimage2D img_density_prefix_count_map;
+
+// One uint per logical shadow-map pixel. Value is the closest-to-light
+// occupied slice, or DENSITY_SLICE_COUNT when the light ray is empty.
+layout(r32ui, binding = 7) uniform uimage2D img_first_blocked_slice_map;
+
+layout(std430, set = 0, binding = 3) writeonly buffer buff_particle_draw {
+    DrawParticle drawParticles[];
+};
+
+// x = lightMin, y = lightMax, z = invRange, w = unused.
+layout(std430, set = 0, binding = 4) readonly buffer buff_light_slice_range {
+    vec4 lightSliceRange;
+};
+
+layout(set = 0, binding = 5) uniform Constants {
+    mat4 VP;
+    mat4 ligVP;
+    vec3 lightDir;
+    float ALPHA;
+    uint DENSITY_WORD_COUNT;
+    uint DENSITY_BITS_PER_WORD;
+    uint DENSITY_SLICE_COUNT;
+    float SHADOW_BLUR_SCALE;
+    float opacityMultiplier;
+    float AMBIENT_OCCLUSION_STRENGTH;
+    float AMBIENT_OCCLUSION_RADIUS;
+    uint AMBIENT_OCCLUSION_SAMPLE_COUNT;
+};
+
+layout(binding = 6) uniform Cfg {
+    uint COUNT;
+    uint SLICE_SIZE;
+} pc;
+
+shared ivec2 logicalSize;
+shared vec2 fsize;
+shared float lightMin;
+shared float invRange;
+
+ivec2 densityPixelCoord(ivec2 logicalPixel, uint wordIndex, ivec2 logicalSize)
+{
+    return ivec2(logicalPixel.x + int(wordIndex) * logicalSize.x, logicalPixel.y);
+}
+
+uint loadDensityWord(ivec2 logicalPixel, uint wordIndex, ivec2 logicalSize)
+{
+    ivec2 tiledPixel = densityPixelCoord(logicalPixel, wordIndex, logicalSize);
+    return imageLoad(img_density_map, tiledPixel).x;
+}
+
+uint lightSliceForPosition(vec3 pos)
+{
+    float t = clamp((dot(lightDir, pos) - lightMin) * invRange, 0.0, 1.0);
+    return min(DENSITY_SLICE_COUNT - 1u, uint(t * float(DENSITY_SLICE_COUNT - 1u) + 0.5));
+}
+
+uint loadPrefixCountBeforeWord(ivec2 logicalPixel, uint wordIndex, ivec2 logicalSize)
+{
+    ivec2 tiledPixel = densityPixelCoord(logicalPixel, wordIndex, logicalSize);
+    return imageLoad(img_density_prefix_count_map, tiledPixel).x;
+}
+
+uint countPreviousBitsIn256Slices(ivec2 logicalPixel, uint eyeSlice, ivec2 logicalSize)
+{
+    if (eyeSlice == 0u) return 0u;
+
+    eyeSlice = min(eyeSlice, DENSITY_SLICE_COUNT - 1u);
+
+    uint currentWord = eyeSlice / DENSITY_BITS_PER_WORD;
+    uint bitInWord   = eyeSlice & 31u;
+
+    uint density = loadPrefixCountBeforeWord(logicalPixel, currentWord, logicalSize);
+
+    if (bitInWord > 0u) {
+        uint wordBits = loadDensityWord(logicalPixel, currentWord, logicalSize);
+        uint previousBitsMask = (1u << bitInWord) - 1u;
+        density += bitCount(wordBits & previousBitsMask);
+    }
+
+    return density;
+}
+
+bool isDensitySliceOccupied(ivec2 logicalPixel, uint slice, ivec2 logicalSize)
+{
+    slice = min(slice, DENSITY_SLICE_COUNT - 1u);
+
+    uint wordIndex = slice / DENSITY_BITS_PER_WORD;
+    uint bitIndex  = slice & 31u;
+    uint wordBits  = loadDensityWord(logicalPixel, wordIndex, logicalSize);
+
+    return (wordBits & (1u << bitIndex)) != 0u;
+}
+
+uint hashUint(uint x)
+{
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float hashFloat01(uint x)
+{
+    return float(hashUint(x) & 0x00ffffffu) / float(0x01000000u);
+}
+
+float randomRadius01(inout uint seed)
+{
+    // Cubic-root distribution gives uniform volume sampling inside a sphere.
+    return pow(RandomFloat01(seed), 1.0 / 3.0);
+}
+
+vec3 clipToTex(vec4 clipPos)
+{
+    vec3 projCoords = clipPos.xyz / clipPos.w;
+    projCoords.xy = projCoords.xy * 0.5 + 0.5;
+    projCoords.y = 1.0 - projCoords.y;
+    return projCoords;
+}
+
+bool lightProjectedPositionToDensityLookup(vec3 worldPos, out ivec2 logicalPixel, out uint slice)
+{
+    vec4 lightClip = ligVP * vec4(worldPos, 1.0);
+
+    if (abs(lightClip.w) < 1e-20) {
+        return false;
+    }
+
+    vec3 projCoords = clipToTex(lightClip);
+
+    if (projCoords.x < 0.0 || projCoords.x > 1.0 ||
+        projCoords.y < 0.0 || projCoords.y > 1.0 ||
+        projCoords.z > 1.0) {
+        return false;
+    }
+
+    logicalPixel = ivec2(fsize * projCoords.xy);
+    logicalPixel = clamp(logicalPixel, ivec2(0), logicalSize - ivec2(1));
+
+    slice = lightSliceForPosition(worldPos);
+
+    return true;
+}
+
+float sampleAmbientOcclusion(vec3 particleWorldPos, uint seed)
+{
+    uint sampleCount = AMBIENT_OCCLUSION_SAMPLE_COUNT;
+
+    float densitySum = 0.0;
+    float weightSum = 0.0;
+
+    float radius = AMBIENT_OCCLUSION_RADIUS;
+
+    for (uint i = 0u; i < 16u; ++i) {
+        if (i >= sampleCount) break;
+
+        vec3 dir = randomUnitVector3(seed);
+        float r = randomRadius01(seed);
+
+        vec3 samplePos = particleWorldPos + dir * radius * r;
+
+        ivec2 sampleLogicalPixel;
+        uint sampleSlice;
+
+        if (!lightProjectedPositionToDensityLookup(samplePos, sampleLogicalPixel, sampleSlice)) {
+            continue;
+        }
+
+        float occupied = isDensitySliceOccupied(sampleLogicalPixel, sampleSlice, logicalSize) ? 1.0 : 0.0;
+
+        // Nearby samples matter slightly more than samples near the edge of the sphere.
+        // r is already normalized in [0..1].
+        float w = exp(-0.5 * r * r);
+
+        densitySum += occupied * w;
+        weightSum += w;
+    }
+
+    float avgOccupancy = densitySum / max(weightSum, 1e-6);
+
+    return exp(-avgOccupancy * AMBIENT_OCCLUSION_STRENGTH);
+}
+
+uint sampleFirstBlockedSlice(vec3 projCoords)
+{
+    if (projCoords.x < 0.0 || projCoords.x > 1.0 ||
+        projCoords.y < 0.0 || projCoords.y > 1.0 ||
+        projCoords.z > 1.0) {
+        return DENSITY_SLICE_COUNT;
+    }
+
+    ivec2 firstSize = imageSize(img_first_blocked_slice_map);
+    ivec2 logicalPixel = ivec2(vec2(firstSize) * projCoords.xy);
+    logicalPixel = clamp(logicalPixel, ivec2(0), firstSize - ivec2(1));
+
+    return imageLoad(img_first_blocked_slice_map, logicalPixel).x;
+}
+
+float sampleShadow(vec3 projCoords, uint slice, vec2 offset)
+{
+    projCoords.xy += offset;
+
+    if (projCoords.x < 0.0 || projCoords.x > 1.0 ||
+        projCoords.y < 0.0 || projCoords.y > 1.0 ||
+        projCoords.z > 1.0) {
+        return 1.0;
+    }
+
+    ivec2 logicalPixel = ivec2(fsize * projCoords.xy);
+    logicalPixel = clamp(logicalPixel, ivec2(0), logicalSize - ivec2(1));
+
+    uint density = countPreviousBitsIn256Slices(logicalPixel, slice, logicalSize);
+    return float(density);
+}
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.COUNT) return;
+
+    if (gl_LocalInvocationIndex == 0) {
+        ivec2 fullSize = imageSize(img_density_map);
+        logicalSize = ivec2(fullSize.x / int(DENSITY_WORD_COUNT), fullSize.y);
+        fsize = vec2(logicalSize);
+        lightMin = lightSliceRange.x;
+        invRange = lightSliceRange.z;
+    }
+
+    barrier();
+
+    uint particleIndex = sortedIndices[gid];
+    Particle p = particles[particleIndex];
+
+    uint slice = lightSliceForPosition(p.pos);
+    if (slice > 0u) {
+        slice -= 1u;
+    }
+
+    DrawParticle d;
+    d.clipCenter = VP * vec4(p.pos, 1.0);
+    d.prevClipCenter = VP * vec4(p.prevPos, 1.0);
+    d.lightClipCenter = ligVP * vec4(p.pos, 1.0);
+
+    // data.x = radius
+    // data.y = direct-light transmittance from the shadow map
+    // data.z = inside/visible flag
+    // data.w = ambient visibility / ambient occlusion factor
+    d.data = vec4(p.rad, 1.0, 0.0, 1.0);
+
+    vec3 uv = clipToTex(d.lightClipCenter);
+
+    uint firstBlockedSlice = sampleFirstBlockedSlice(uv);
+    uint sliceTravelAfterFirstBlocker = 0u;
+
+    if (firstBlockedSlice < slice) {
+        sliceTravelAfterFirstBlocker = slice - firstBlockedSlice;
+    }
+
+    float eps = float(sliceTravelAfterFirstBlocker) * SHADOW_BLUR_SCALE;
+
+    uint seed = particleIndex + 9999u;
+
+    d.data.y = 0.0;
+
+    float numSamples = 4.0;
+    for (int i = 0; i < int(numSamples); i++) {
+        d.data.y += sampleShadow(uv, slice, randomUnitVector2(seed) * eps);
+    }
+
+    d.data.y /= numSamples;
+    d.data.y = exp(-d.data.y * opacityMultiplier);
+
+    // New 3D ambient occlusion:
+    // sample points inside a sphere around the particle, project each point into
+    // the density map, compute that sample point's light-space slice, then test
+    // whether that texel/slice is occupied.
+    d.data.w = sampleAmbientOcclusion(p.pos, seed);
+
+    d.data.z = 1.0;
+
+    drawParticles[gid] = d;
+}

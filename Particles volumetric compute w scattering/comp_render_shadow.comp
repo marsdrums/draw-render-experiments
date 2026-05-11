@@ -4,8 +4,9 @@ layout(local_size_x = 256) in;
 
 struct DrawParticle{
     vec4 clipCenter;
+    vec4 prevClipCenter;
     vec4 lightClipCenter;
-    // x = radius, y = center shadow/light, z = inside flag, w = unused
+    // x = radius, y = center shadow/light, z = inside flag, w = light-space AABB slice index
     vec4 data;
 };
 
@@ -29,7 +30,6 @@ layout(r32ui, binding = 1) uniform uimage2D img_density_map;
 layout(binding = 2) uniform Cfg{
     uint COUNT;
     uint SLICE_SIZE;
-    uint FLIPPED;
     float ALPHA;
     mat4 P;
     uint DENSITY_WORD_COUNT;
@@ -40,30 +40,6 @@ layout(binding = 2) uniform Cfg{
 ivec2 densityPixelCoord(ivec2 logicalPixel, uint wordIndex, ivec2 logicalSize)
 {
     return ivec2(logicalPixel.x + int(wordIndex) * logicalSize.x, logicalPixel.y);
-}
-
-uint logicalSliceFromDrawIndex(uint drawOrderIndex)
-{
-    // drawOrderIndex is the compact order used by the single draw/compute pass.
-    // For flipped views, drawParticles[] has already been reordered to match the
-    // old sliced loop, so the first emitted particles belong to logical slice 0.
-    if (SLICE_SIZE == 0u || FLIPPED == 0u) {
-        return min(DENSITY_SLICE_COUNT - 1u, drawOrderIndex / max(SLICE_SIZE, 1u));
-    }
-
-    uint actualSliceCount = (COUNT + SLICE_SIZE - 1u) / SLICE_SIZE;
-    actualSliceCount = clamp(actualSliceCount, 1u, DENSITY_SLICE_COUNT);
-
-    uint lastPhysicalSlice = actualSliceCount - 1u;
-    uint lastSliceStart = lastPhysicalSlice * SLICE_SIZE;
-    uint lastSliceCount = COUNT - lastSliceStart;
-
-    if (drawOrderIndex < lastSliceCount) {
-        return 0u;
-    }
-
-    uint remaining = drawOrderIndex - lastSliceCount;
-    return min(DENSITY_SLICE_COUNT - 1u, 1u + remaining / SLICE_SIZE);
 }
 
 void main() {
@@ -77,12 +53,14 @@ void main() {
 
     DrawParticle p = drawParticles[gid];
 
-    uint slice = logicalSliceFromDrawIndex(gid);
+    uint slice = min(DENSITY_SLICE_COUNT - 1u, uint(round(p.data.w)));
     uint wordIndex = slice / DENSITY_BITS_PER_WORD;   // 0..7
     uint bitIndex  = slice & 31u;                     // 0..31
     uint value = 1u << bitIndex;
 
-    float rad = p.data.x;
+    //since i'm not using transparency in shadow rendering, i make the particle slightly 
+    //smaller to account for the feathered edges, also speeding up the rendering
+    float rad = p.data.x; 
     vec4 a = P[0] * rad;
     vec4 b = P[1] * rad;
 

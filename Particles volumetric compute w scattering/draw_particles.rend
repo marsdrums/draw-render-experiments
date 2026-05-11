@@ -1,0 +1,163 @@
+#version 460
+
+#pragma stage(vertex)
+
+struct DrawParticle{
+    vec4 clipCenter;
+    vec4 prevClipCenter;
+    vec4 lightClipCenter;
+    // x = radius, y = center shadow/light, z = inside flag, w = light-space AABB slice index
+    vec4 data;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particle_draw {
+    DrawParticle drawParticles[];
+};
+
+layout(set = 0, binding = 1) uniform Constants {
+    mat4 V;
+    mat4 P;
+    mat4 ligV;
+    mat4 ligP;
+    vec3 lightDir;
+    float ALPHA;
+    float MOTION_BLUR_STRENGTH;
+    float MOTION_BLUR_MAX_STRETCH;
+    float ASPECT;
+    vec3 AMBIENT_LIGHT;
+};
+
+layout(location = 0) in vec4 offset;
+
+layout(location = 0) out vec3 col;
+layout(location = 1) out vec2 capsuleCoord;
+layout(location = 2) out float motionHalfLengthInRadii;
+layout(location = 3) out float alphaCompensation;
+
+void main()
+{
+    DrawParticle d = drawParticles[gl_InstanceIndex];
+
+    vec3 alb = vec3(0.7);//vec3(0.8, 0.3, 0.2);
+    vec3 ligCol = vec3(4,3,2);
+
+    // d.data.y = direct-light transmittance / shadow factor
+    // d.data.w = ambient visibility after density-map ambient occlusion
+    vec3 directLight = ligCol * d.data.y;
+    vec3 ambientLight = AMBIENT_LIGHT * d.data.w;
+    col = alb * (directLight + ambientLight);
+    //col = ambientLight * alb;
+
+    float currentW = max(abs(d.clipCenter.w), 1e-6);
+    vec2 currentNdc = d.clipCenter.xy / currentW;
+
+    bool validPrev = abs(d.prevClipCenter.w) > 1e-6;
+    vec2 previousNdc = validPrev ? (d.prevClipCenter.xy / d.prevClipCenter.w) : currentNdc;
+
+    // Work in aspect-corrected NDC metric space. In this space, one unit in x
+    // and y corresponds to the same screen/pixel distance.
+    vec2 metricScale = vec2(max(ASPECT, 1e-6), 1.0);
+    vec2 currentMetric = currentNdc * metricScale;
+    vec2 previousMetric = mix(currentMetric, previousNdc * metricScale, clamp(MOTION_BLUR_STRENGTH, 0.0, 1.0));
+
+    vec2 motion = currentMetric - previousMetric;
+    float motionLength = length(motion);
+
+    vec2 axis = (motionLength > 1e-7) ? (motion / motionLength) : vec2(1.0, 0.0);
+    vec2 perp = vec2(-axis.y, axis.x);
+
+    // Radius in the same aspect-corrected NDC metric. P[1].y is the vertical
+    // projection scale, so radiusMetric is the current screen-space particle radius.
+    float radiusMetric = max(abs(P[1].y) * d.data.x / currentW, 1e-7);
+
+    float halfLength = 0.5 * motionLength;
+    float maxHalfLength = max(MOTION_BLUR_MAX_STRETCH, 0.0) * radiusMetric;
+    halfLength = min(halfLength, maxHalfLength);
+
+    // The segment runs from the current position toward the previous position.
+    // When unclamped, this exactly spans the two projected particle centers.
+    vec2 centerMetric = currentMetric - axis * halfLength;
+
+    float halfLengthInRadii = halfLength / radiusMetric;
+    float alongExtent = halfLength + radiusMetric;
+
+    vec2 vertexMetric = centerMetric
+                      + axis * (offset.x * alongExtent)
+                      + perp * (offset.y * radiusMetric);
+
+    vec2 vertexNdc = vertexMetric / metricScale;
+
+    capsuleCoord = vec2(offset.x * (halfLengthInRadii + 1.0), offset.y);
+    motionHalfLengthInRadii = halfLengthInRadii;
+
+    // Keep the integrated emitted radiance stable as the particle is stretched.
+    //
+    // The fragment shader does not draw a hard, uniform capsule; it draws a
+    // capsule with the same quadratic falloff used by the original circular
+    // particle:
+    //
+    //     alpha = (1 - r^2)^2
+    //
+    // Therefore the physically consistent compensation is not just the inverse
+    // of the geometric capsule-area ratio. It is the inverse of the growth in
+    // the integrated alpha footprint:
+    //
+    //     I_circle  = PI / 3
+    //     I_capsule = PI / 3 + (32 / 15) * halfLengthInRadii
+    //
+    // so:
+    //
+    //     compensation = I_circle / I_capsule
+    //                  = 1 / (1 + 32 * halfLengthInRadii / (5 * PI))
+    //
+    // This makes a stretched particle emit the same total amount of light as
+    // the unstretched particle, assuming color is interpreted as emitted
+    // radiance modulated by the premultiplied alpha footprint.
+    const float PI = 3.14159265358979323846;
+    float integratedAlphaStretch = 1.0 + (32.0 * halfLengthInRadii) / (5.0 * PI);
+    alphaCompensation = 1.0 / max(integratedAlphaStretch, 1e-6);
+
+    gl_Position = vec4(vertexNdc * d.clipCenter.w, d.clipCenter.z, d.clipCenter.w);
+}
+
+#pragma stage(fragment)
+
+layout(location = 0) in vec3 col;
+layout(location = 1) in vec2 capsuleCoord;
+layout(location = 2) in float motionHalfLengthInRadii;
+layout(location = 3) in float alphaCompensation;
+
+layout(location = 0) out vec4 fragColor;
+
+layout(set = 0, binding = 1) uniform Constants {
+    mat4 V;
+    mat4 P;
+    mat4 ligV;
+    mat4 ligP;
+    vec3 lightDir;
+    float ALPHA;
+    float MOTION_BLUR_STRENGTH;
+    float MOTION_BLUR_MAX_STRETCH;
+    float ASPECT;
+    vec3 AMBIENT_LIGHT;
+};
+
+void main()
+{
+    // Signed local capsule distance in particle-radius units. With no motion,
+    // motionHalfLengthInRadii is zero and this reduces to the original circle.
+    float axialOutside = max(abs(capsuleCoord.x) - motionHalfLengthInRadii, 0.0);
+    float r2 = axialOutside * axialOutside + capsuleCoord.y * capsuleCoord.y;
+
+    if (r2 > 1.0) {
+        discard;
+        return;
+    }
+
+    float a = 1.0 - r2;
+    a *= a;
+    a *= ALPHA;
+    a *= alphaCompensation;
+
+    fragColor = vec4(col * a, a); // pre-multiplied alpha
+}

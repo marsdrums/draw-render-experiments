@@ -1,0 +1,66 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+    vec2    _pad0;
+    vec3    prevPos;
+    float   _pad1;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+// Sorted permutation. Each entry stores an index into buff_particles.
+layout(std430, set = 0, binding = 1) writeonly buffer buff_sorted_indices {
+    uint sortedIndices[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer buff_radix_bin_offsets {
+    uint binOffsets[];
+};
+
+layout(std430, set = 0, binding = 3) buffer buff_radix_cursor {
+    uint cursor[];
+};
+
+// sortRange[0..1] = ordered-float min/max camera sort key; sortRange[2..7] stores the particle AABB.
+layout(std430, set = 0, binding = 4) readonly buffer buff_sort_range {
+    uint sortRange[];
+};
+
+layout(binding = 5) uniform Cfg {
+    uint COUNT;
+};
+
+float ordered_uint_to_float(uint ordered) {
+    uint u = ((ordered & 0x80000000u) != 0u) ? (ordered ^ 0x80000000u) : ~ordered;
+    return uintBitsToFloat(u);
+}
+
+uint depth_to_key16(float projected) {
+    float keyMin = ordered_uint_to_float(sortRange[0]);
+    float keyMax = ordered_uint_to_float(sortRange[1]);
+    float range = max(keyMax - keyMin, 1e-20);
+    float t = clamp((projected - keyMin) / range, 0.0, 1.0);
+    return uint(t * 65535.0 + 0.5);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= COUNT) return;
+
+    uint key = depth_to_key16(particles[gid].key);
+
+    uint localIndexInBin = atomicAdd(cursor[key], 1u);
+    uint sortedIndex = binOffsets[key] + localIndexInBin;
+
+    // Move only the 4-byte index, not the full Particle struct.
+    sortedIndices[sortedIndex] = gid;
+}

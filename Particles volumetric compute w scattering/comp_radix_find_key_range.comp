@@ -1,0 +1,56 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+    vec2    _pad0;
+    vec3    prevPos;
+    float   _pad1;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+// sortRange[0..1] = ordered-float min/max camera sort key.
+// sortRange[2..4] = ordered-float AABB min xyz.
+// sortRange[5..7] = ordered-float AABB max xyz.
+layout(std430, set = 0, binding = 1) buffer buff_sort_range {
+    uint sortRange[];
+};
+
+layout(binding = 2) uniform Cfg {
+    uint COUNT;
+};
+
+uint float_to_ordered_uint(float v) {
+    uint u = floatBitsToUint(v);
+    return ((u & 0x80000000u) != 0u) ? ~u : (u ^ 0x80000000u);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= COUNT) return;
+
+    Particle p = particles[gid];
+
+    uint orderedKey = float_to_ordered_uint(p.key);
+    atomicMin(sortRange[0], orderedKey);
+    atomicMax(sortRange[1], orderedKey);
+
+    uint ox = float_to_ordered_uint(p.pos.x);
+    uint oy = float_to_ordered_uint(p.pos.y);
+    uint oz = float_to_ordered_uint(p.pos.z);
+
+    atomicMin(sortRange[2], ox);
+    atomicMin(sortRange[3], oy);
+    atomicMin(sortRange[4], oz);
+    atomicMax(sortRange[5], ox);
+    atomicMax(sortRange[6], oy);
+    atomicMax(sortRange[7], oz);
+}

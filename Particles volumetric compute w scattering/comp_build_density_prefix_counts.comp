@@ -1,0 +1,47 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Packed occupancy map. Horizontal tiles contain 32 light slices per uint word.
+layout(r32ui, binding = 0) uniform readonly uimage2D img_density_map;
+
+// Same tiling as img_density_map. For each logical shadow pixel and word W,
+// this stores the number of occupied bits in all words before W.
+// word 0 -> 0
+// word 1 -> bitCount(density word 0)
+// word 2 -> bitCount(words 0..1)
+// etc.
+layout(r32ui, binding = 1) uniform writeonly uimage2D img_density_prefix_count_map;
+
+layout(binding = 2) uniform Cfg {
+    uint DENSITY_WORD_COUNT;
+    uint DENSITY_BITS_PER_WORD;
+    uint DENSITY_SLICE_COUNT;
+};
+
+ivec2 densityPixelCoord(ivec2 logicalPixel, uint wordIndex, ivec2 logicalSize)
+{
+    return ivec2(logicalPixel.x + int(wordIndex) * logicalSize.x, logicalPixel.y);
+}
+
+void main()
+{
+    ivec2 logicalPixel = ivec2(gl_GlobalInvocationID.xy);
+
+    ivec2 fullDensitySize = imageSize(img_density_map);
+    ivec2 logicalSize = ivec2(fullDensitySize.x / int(DENSITY_WORD_COUNT), fullDensitySize.y);
+
+    if (logicalPixel.x >= logicalSize.x || logicalPixel.y >= logicalSize.y) return;
+
+    uint prefix = 0u;
+
+    for (uint word = 0u; word < DENSITY_WORD_COUNT; ++word) {
+        ivec2 tiledPixel = densityPixelCoord(logicalPixel, word, logicalSize);
+
+        // Store count of all occupied slices before this 32-bit word.
+        imageStore(img_density_prefix_count_map, tiledPixel, uvec4(prefix, 0u, 0u, 0u));
+
+        uint bits = imageLoad(img_density_map, tiledPixel).x;
+        prefix += bitCount(bits);
+    }
+}

@@ -1,0 +1,74 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "c74.noise.funcs.glsl"
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+    vec2    _pad0;
+    vec3    prevPos;
+    float   _pad1;
+};
+
+// Storage buffer for particle data
+layout(std430, set = 0, binding = 0) buffer buff_particles {
+    Particle particles[]; 
+};
+
+layout(binding = 1) uniform Cfg {
+    float TIME;
+    uint COUNT;
+    uint SQRT_COUNT;
+    float SCALE;
+    vec3 SORT_VECTOR;
+    float RADIUS;
+    vec3 CAMERA_POS;
+};
+
+vec3 particlePositionAtTime(uint gid, float t)
+{
+    vec3 seed;
+    seed.x = float(gid % SQRT_COUNT) * SCALE + t;
+    seed.y = float(gid / SQRT_COUNT) * SCALE + t;
+    seed.z = TIME*0.1;
+
+    vec3 pos;
+    pos.x = Normalize(fBmA(seed                  ,  0.9, 2.0, 1., 12.));
+    pos.y = Normalize(fBmA(seed + vec3(1,2,3)*100,  0.9, 2.0, 1., 12.));
+    pos.z = Normalize(fBmA(seed + vec3(1,2,3)*200,  0.9, 2.0, 1., 12.));
+
+    pos = 0.5*(pos * 2.0 - 1.0);
+
+    // Keep the static per-particle jitter identical for current and previous
+    // positions so motion blur only represents actual procedural motion.
+    uint jittSeed = gid + 999u;
+    vec3 jittering = (RandomVec301(jittSeed) - 0.5) * 0.005;
+    return pos;// + jittering;
+}
+
+void main() {
+
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= COUNT) return;
+
+    Particle p;
+
+    p.prevPos = particles[gid].pos;
+    p.pos = particlePositionAtTime(gid, TIME);
+
+    p.rad = RADIUS;
+    p.col = vec4(sin(float(gid) * vec3(1,2,3))*0.5 + 0.5,1);
+    p.id = gid;
+    p._pad0 = vec2(0.0);
+    p._pad1 = 0.0;
+    // Camera-front-to-back key.  The radix pass sorts ascending, so particles
+    // closest along the camera forward direction are emitted first.
+    p.key = dot(SORT_VECTOR, p.pos - CAMERA_POS);
+
+    particles[gid] = p;
+}

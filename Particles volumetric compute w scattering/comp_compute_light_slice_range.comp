@@ -1,0 +1,47 @@
+#version 460
+
+layout(local_size_x = 1) in;
+
+// sortRange[0..1] = camera key min/max, sortRange[2..7] = particle AABB.
+layout(std430, set = 0, binding = 0) readonly buffer buff_sort_range {
+    uint sortRange[];
+};
+
+// x = lightMin, y = lightMax, z = invRange, w = unused.
+layout(std430, set = 0, binding = 1) writeonly buffer buff_light_slice_range {
+    vec4 lightSliceRange;
+};
+
+layout(set = 0, binding = 2) uniform Constants {
+    vec3 lightDir;
+};
+
+float ordered_uint_to_float(uint ordered) {
+    uint u = ((ordered & 0x80000000u) != 0u) ? (ordered ^ 0x80000000u) : ~ordered;
+    return uintBitsToFloat(u);
+}
+
+void main()
+{
+    vec3 bmin = vec3(ordered_uint_to_float(sortRange[2]),
+                     ordered_uint_to_float(sortRange[3]),
+                     ordered_uint_to_float(sortRange[4]));
+    vec3 bmax = vec3(ordered_uint_to_float(sortRange[5]),
+                     ordered_uint_to_float(sortRange[6]),
+                     ordered_uint_to_float(sortRange[7]));
+
+    float lightMin =  3.402823466e+38;
+    float lightMax = -3.402823466e+38;
+
+    for (uint i = 0u; i < 8u; ++i) {
+        vec3 c = vec3((i & 1u) != 0u ? bmax.x : bmin.x,
+                      (i & 2u) != 0u ? bmax.y : bmin.y,
+                      (i & 4u) != 0u ? bmax.z : bmin.z);
+        float v = dot(lightDir, c);
+        lightMin = min(lightMin, v);
+        lightMax = max(lightMax, v);
+    }
+
+    float invRange = 1.0 / max(lightMax - lightMin, 1e-20);
+    lightSliceRange = vec4(lightMin, lightMax, invRange, 0.0);
+}

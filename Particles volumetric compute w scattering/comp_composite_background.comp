@@ -1,0 +1,22 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba32f, binding = 0) uniform image2D img_color_target;
+
+layout(binding = 1) uniform Cfg{
+    vec4 background;
+};
+
+void main() {
+
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(img_color_target);
+
+    if (gid.x >= size.x || gid.y >= size.y) return;
+
+    vec4 col = imageLoad(img_color_target, gid);
+
+    vec3 finalRgb = col.rgb + background.rgb * (1.0 - col.a);
+    imageStore(img_color_target, gid, vec4(finalRgb, 1.0));
+}

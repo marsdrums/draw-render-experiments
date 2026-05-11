@@ -44,10 +44,11 @@ layout(binding = 4) uniform Cfg {
     uint FLIPPED;
 } pc;
 
-
-#define DENSITY_WORD_COUNT 8u
-#define DENSITY_BITS_PER_WORD 32u
-#define DENSITY_SLICE_COUNT (DENSITY_WORD_COUNT * DENSITY_BITS_PER_WORD)
+layout(binding = 5) uniform SliceParams {
+    uint DENSITY_WORD_COUNT;
+    uint DENSITY_BITS_PER_WORD;
+    uint DENSITY_SLICE_COUNT;
+};
 
 uint sortedIndexFromDrawOrder(uint drawOrderIndex)
 {

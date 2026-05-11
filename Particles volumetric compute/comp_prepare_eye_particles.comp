@@ -2,10 +2,6 @@
 
 layout(local_size_x = 256) in;
 
-#define DENSITY_WORD_COUNT 8u
-#define DENSITY_BITS_PER_WORD 32u
-#define DENSITY_SLICE_COUNT (DENSITY_WORD_COUNT * DENSITY_BITS_PER_WORD)
-
 struct Particle{
     vec3    pos;
     float   rad;
@@ -52,6 +48,9 @@ layout(set = 0, binding = 4) uniform Constants {
     mat4 ligVP;
     vec3 lightDir;
     float ALPHA;
+    uint DENSITY_WORD_COUNT;
+    uint DENSITY_BITS_PER_WORD;
+    uint DENSITY_SLICE_COUNT;
 };
 
 layout(binding = 5) uniform Cfg {
@@ -212,7 +211,7 @@ void main()
     d.data.y += sampleShadow(uv, slice, vec2(+eps,+eps)) * 0.0625;
     d.data.y += sampleShadow(uv, slice, vec2(-eps,+eps)) * 0.0625;
     d.data.y += sampleShadow(uv, slice, vec2(-eps,-eps)) * 0.0625;
-    d.data.y = exp(-d.data.y * ALPHA * 0.4);
+    d.data.y = exp(-d.data.y * ALPHA * 2.0 / float(DENSITY_WORD_COUNT));
     d.data.z = 1.0;
 
     // drawParticles is addressed by compact render order, not original particle id.

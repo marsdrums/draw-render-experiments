@@ -1,0 +1,38 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer buff_radix_histogram {
+    uint histogram[];
+};
+
+layout(std430, set = 0, binding = 1) buffer buff_radix_cursor {
+    uint cursor[];
+};
+
+// sortRange[0..1] = ordered-float min/max camera sort key.
+// sortRange[2..4] = ordered-float AABB min xyz.
+// sortRange[5..7] = ordered-float AABB max xyz.
+// Ordered-float encoding lets atomicMin/atomicMax work correctly for signed floats.
+layout(std430, set = 0, binding = 2) buffer buff_sort_range {
+    uint sortRange[];
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    histogram[gid] = 0u;
+    cursor[gid] = 0u;
+
+    if (gid == 0u) {
+        sortRange[0] = 0xffffffffu; // camera key min
+        sortRange[1] = 0u;          // camera key max
+
+        sortRange[2] = 0xffffffffu; // aabb min x
+        sortRange[3] = 0xffffffffu; // aabb min y
+        sortRange[4] = 0xffffffffu; // aabb min z
+        sortRange[5] = 0u;          // aabb max x
+        sortRange[6] = 0u;          // aabb max y
+        sortRange[7] = 0u;          // aabb max z
+    }
+}

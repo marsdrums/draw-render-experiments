@@ -12,7 +12,19 @@ let sliceSize;
 let particleCount;
 let sliceCount = 256;
 let scale = 0.0006;
-let shadowMapSize = 1024;
+let shadowMapSize = 512;
+let shadowBlurScale = 0.0002;
+let ambientOcclusionStrength = 4.0;
+let ambientOcclusionRadius = 0.05;
+let ambientOcclusionSampleCount = 8;
+let ambientLight = [0.2, 0.25, 0.4];
+//let ambientLight = [0.8, 0.8, 0.8];
+//let ambientLight = [0.7, 0.7, 0.7];
+let motionBlurStrength = 1.0;
+let motionBlurMaxStretch = 32.0;
+let previousGeneratedTime = null;
+
+let DENSITY_WORD_COUNT, DENSITY_BITS_PER_WORD, DENSITY_SLICE_COUNT;
 
 // One-pass radix/counting sort settings.
 // The sort key range is measured on the GPU every frame, so particle positions
@@ -22,19 +34,18 @@ const RADIX_BINS = 1 << RADIX_BITS;      // 65536 depth buckets
 const RADIX_BLOCK_SIZE = 256;            // scan block size
 const RADIX_BLOCK_COUNT = RADIX_BINS / RADIX_BLOCK_SIZE;
 
-let lightDir = normalizeVec3([1,1,1]);
-let halfVector, flipped;
+let lightDir = normalizeVec3([-1,-1,-1]);
 
 let proxy_camera = new JitterObject("jit.proxy");
 
-// particle buffer: Pos(vec3), rad(float), col(vec4), key(float), id(uint)
+// particle buffer: pos(vec3), rad(float), col(vec4), key(float), id(uint), padding, prevPos(vec3), padding
 // The particle buffer remains in original/generated order. Sorting now produces
 // a compact uint permutation buffer instead of moving full Particle structs.
 let buff_particles = new JitterObject("jit.gpu.buffer");
 let buff_sorted_indices = new JitterObject("jit.gpu.buffer");
 
 // Per-particle data prepared once per slice and reused by the 4 quad vertices.
-// Layout matches DrawParticle in the draw/prepare shaders: 3 vec4 = 48 bytes.
+// Layout matches DrawParticle in the draw/prepare shaders: 4 vec4 = 64 bytes.
 let buff_particle_draw = new JitterObject("jit.gpu.buffer");
 
 let buff_quad = new JitterObject("jit.gpu.buffer");
@@ -70,7 +81,9 @@ let buff_radix_cursor = new JitterObject("jit.gpu.buffer");
 let buff_radix_bin_offsets = new JitterObject("jit.gpu.buffer");
 let buff_radix_block_sums = new JitterObject("jit.gpu.buffer");
 let buff_radix_block_offsets = new JitterObject("jit.gpu.buffer");
-let buff_sort_range = new JitterObject("jit.gpu.buffer"); // uint min/max of ordered float particle keys
+let buff_sort_range = new JitterObject("jit.gpu.buffer"); // uint ordered-float camera key range plus particle AABB
+// Precomputed projection of the particle AABB onto lightDir: vec4(lightMin, lightMax, invRange, unused).
+let buff_light_slice_range = new JitterObject("jit.gpu.buffer");
 
 let comp_radix_clear = new JitterObject("jit.gpu.compute");
 comp_radix_clear.shader = "comp_radix_clear.comp";
@@ -117,6 +130,12 @@ comp_radix_scatter_particles.bind("buff_radix_bin_offsets", buff_radix_bin_offse
 comp_radix_scatter_particles.bind("buff_radix_cursor", buff_radix_cursor.name);
 comp_radix_scatter_particles.bind("buff_sort_range", buff_sort_range.name);
 
+let comp_compute_light_slice_range = new JitterObject("jit.gpu.compute");
+comp_compute_light_slice_range.shader = "comp_compute_light_slice_range.comp";
+comp_compute_light_slice_range.workgroups = [1, 1, 1];
+comp_compute_light_slice_range.bind("buff_sort_range", buff_sort_range.name);
+comp_compute_light_slice_range.bind("buff_light_slice_range", buff_light_slice_range.name);
+
 let img_color_target = new JitterObject("jit.gpu.image");
 img_color_target.dim = [VIEWPORT[0], VIEWPORT[1]];
 img_color_target.format = "rgba32_float";
@@ -130,6 +149,21 @@ let img_density_map = new JitterObject("jit.gpu.image");
 img_density_map.dim = [shadowMapSize * Math.ceil(sliceCount / 32), shadowMapSize];
 img_density_map.format = "r32_uint";
 
+// Same tiling as img_density_map. For each logical pixel and density word,
+// stores the number of occupied bits in all previous words. This lets the eye
+// pass answer "how many blockers are before this slice?" with one prefix load
+// plus one current-word load instead of scanning all previous words per tap.
+let img_density_prefix_count_map = new JitterObject("jit.gpu.image");
+img_density_prefix_count_map.dim = [shadowMapSize * Math.ceil(sliceCount / 32), shadowMapSize];
+img_density_prefix_count_map.format = "r32_uint";
+
+// Closest-to-light occupied slice per logical shadow-map pixel. This is derived
+// from img_density_map after the shadow occupancy pass and used to choose a
+// scattering blur radius based on distance from the first blocker.
+let img_first_blocked_slice_map = new JitterObject("jit.gpu.image");
+img_first_blocked_slice_map.dim = [shadowMapSize, shadowMapSize];
+img_first_blocked_slice_map.format = "r32_uint";
+
 let comp_clear_color_target = new JitterObject("jit.gpu.compute");
 comp_clear_color_target.shader = "comp_clear_color_target.comp";
 comp_clear_color_target.bind("img_color_target", img_color_target.name);
@@ -138,20 +172,36 @@ comp_clear_color_target.workgroups = [Math.ceil(VIEWPORT[0] / 16), Math.ceil(VIE
 let comp_clear_shadow_map = new JitterObject("jit.gpu.compute");
 comp_clear_shadow_map.shader = "comp_clear_shadow_map.comp";
 comp_clear_shadow_map.bind("img_density_map", img_density_map.name);
-comp_clear_shadow_map.workgroups = [Math.ceil((shadowMapSize * 8) / 16), Math.ceil(shadowMapSize / 16), 1];
+comp_clear_shadow_map.workgroups = [Math.ceil((shadowMapSize * Math.ceil(sliceCount / 32)) / 16), Math.ceil(shadowMapSize / 16), 1];
+
+let comp_find_first_blocked_slice = new JitterObject("jit.gpu.compute");
+comp_find_first_blocked_slice.shader = "comp_find_first_blocked_slice.comp";
+comp_find_first_blocked_slice.bind("img_density_map", img_density_map.name);
+comp_find_first_blocked_slice.bind("img_first_blocked_slice_map", img_first_blocked_slice_map.name);
+comp_find_first_blocked_slice.workgroups = [Math.ceil(shadowMapSize / 16), Math.ceil(shadowMapSize / 16), 1];
+
+let comp_build_density_prefix_counts = new JitterObject("jit.gpu.compute");
+comp_build_density_prefix_counts.shader = "comp_build_density_prefix_counts.comp";
+comp_build_density_prefix_counts.bind("img_density_map", img_density_map.name);
+comp_build_density_prefix_counts.bind("img_density_prefix_count_map", img_density_prefix_count_map.name);
+comp_build_density_prefix_counts.workgroups = [Math.ceil(shadowMapSize / 16), Math.ceil(shadowMapSize / 16), 1];
 
 let comp_prepare_eye_particles = new JitterObject("jit.gpu.compute");
 comp_prepare_eye_particles.shader = "comp_prepare_eye_particles.comp";
 comp_prepare_eye_particles.bind("buff_particles", buff_particles.name);
 comp_prepare_eye_particles.bind("buff_sorted_indices", buff_sorted_indices.name);
 comp_prepare_eye_particles.bind("img_density_map", img_density_map.name);
+comp_prepare_eye_particles.bind("img_density_prefix_count_map", img_density_prefix_count_map.name);
+comp_prepare_eye_particles.bind("img_first_blocked_slice_map", img_first_blocked_slice_map.name);
 comp_prepare_eye_particles.bind("buff_particle_draw", buff_particle_draw.name);
+comp_prepare_eye_particles.bind("buff_light_slice_range", buff_light_slice_range.name);
 
 let comp_prepare_shadow_particles = new JitterObject("jit.gpu.compute");
 comp_prepare_shadow_particles.shader = "comp_prepare_shadow_particles.comp";
 comp_prepare_shadow_particles.bind("buff_particles", buff_particles.name);
 comp_prepare_shadow_particles.bind("buff_sorted_indices", buff_sorted_indices.name);
 comp_prepare_shadow_particles.bind("buff_particle_draw", buff_particle_draw.name);
+comp_prepare_shadow_particles.bind("buff_light_slice_range", buff_light_slice_range.name);
 
 // shadow pass
 
@@ -173,6 +223,10 @@ draw_particles.elemcount = 4;
 draw_particles.blendenable = true;
 draw_particles.depth_write = false;
 draw_particles.param("ALPHA", ALPHA);
+draw_particles.param("MOTION_BLUR_STRENGTH", motionBlurStrength);
+draw_particles.param("MOTION_BLUR_MAX_STRETCH", motionBlurMaxStretch);
+draw_particles.param("ASPECT", RATIO);
+draw_particles.param("AMBIENT_LIGHT", ambientLight);
 draw_particles.blendcolorsrc = "inv_dst_alpha";
 draw_particles.blendcolordst = "one";
 draw_particles.blendalphasrc = "inv_dst_alpha";
@@ -209,16 +263,31 @@ function setradius(x){
 
 function setslice_count(x){
     sliceCount = Math.max(1, x);
-    let DENSITY_WORD_COUNT = Math.ceil(sliceCount / 32);
-    let DENSITY_BITS_PER_WORD = 32;
-    let DENSITY_SLICE_COUNT = DENSITY_WORD_COUNT * DENSITY_BITS_PER_WORD;
+    DENSITY_WORD_COUNT = Math.ceil(sliceCount / 32);
+    DENSITY_BITS_PER_WORD = 32;
+    DENSITY_SLICE_COUNT = DENSITY_WORD_COUNT * DENSITY_BITS_PER_WORD;
     img_density_map.dim = [shadowMapSize * DENSITY_WORD_COUNT, shadowMapSize];
+    img_density_prefix_count_map.dim = [shadowMapSize * DENSITY_WORD_COUNT, shadowMapSize];
+    img_first_blocked_slice_map.dim = [shadowMapSize, shadowMapSize];
+    comp_clear_shadow_map.workgroups = [Math.ceil((shadowMapSize * DENSITY_WORD_COUNT) / 16), Math.ceil(shadowMapSize / 16), 1];
+    comp_find_first_blocked_slice.workgroups = [Math.ceil(shadowMapSize / 16), Math.ceil(shadowMapSize / 16), 1];
+    comp_build_density_prefix_counts.workgroups = [Math.ceil(shadowMapSize / 16), Math.ceil(shadowMapSize / 16), 1];
+    comp_find_first_blocked_slice.param("DENSITY_WORD_COUNT", DENSITY_WORD_COUNT);
+    comp_find_first_blocked_slice.param("DENSITY_BITS_PER_WORD", 32);
+    comp_find_first_blocked_slice.param("DENSITY_SLICE_COUNT", DENSITY_SLICE_COUNT);
+    comp_build_density_prefix_counts.param("DENSITY_WORD_COUNT", DENSITY_WORD_COUNT);
+    comp_build_density_prefix_counts.param("DENSITY_BITS_PER_WORD", 32);
+    comp_build_density_prefix_counts.param("DENSITY_SLICE_COUNT", DENSITY_SLICE_COUNT);
     comp_render_shadow.param("DENSITY_WORD_COUNT", DENSITY_WORD_COUNT);
     comp_render_shadow.param("DENSITY_BITS_PER_WORD", 32);
     comp_render_shadow.param("DENSITY_SLICE_COUNT", DENSITY_SLICE_COUNT);
     comp_prepare_eye_particles.param("DENSITY_WORD_COUNT", DENSITY_WORD_COUNT);
     comp_prepare_eye_particles.param("DENSITY_BITS_PER_WORD", 32);
     comp_prepare_eye_particles.param("DENSITY_SLICE_COUNT", DENSITY_SLICE_COUNT);
+    comp_prepare_eye_particles.param("SHADOW_BLUR_SCALE", shadowBlurScale);
+    comp_prepare_eye_particles.param("AMBIENT_OCCLUSION_STRENGTH", ambientOcclusionStrength);
+    comp_prepare_eye_particles.param("AMBIENT_OCCLUSION_RADIUS", ambientOcclusionRadius);
+    comp_prepare_eye_particles.param("AMBIENT_OCCLUSION_SAMPLE_COUNT", ambientOcclusionSampleCount);
     comp_prepare_shadow_particles.param("DENSITY_WORD_COUNT", DENSITY_WORD_COUNT);
     comp_prepare_shadow_particles.param("DENSITY_BITS_PER_WORD", 32);
     comp_prepare_shadow_particles.param("DENSITY_SLICE_COUNT", DENSITY_SLICE_COUNT);
@@ -228,6 +297,46 @@ function setslice_count(x){
 function setscale(x){
     scale = x;
 }
+
+function setshadow_blur_scale(x){
+    shadowBlurScale = Math.max(0, x);
+    comp_prepare_eye_particles.param("SHADOW_BLUR_SCALE", shadowBlurScale);
+}
+
+function setambient_occlusion_strength(x){
+    ambientOcclusionStrength = Math.max(0, x);
+    comp_prepare_eye_particles.param("AMBIENT_OCCLUSION_STRENGTH", ambientOcclusionStrength);
+}
+
+function setambient_occlusion_radius(x){
+    ambientOcclusionRadius = Math.max(0, x);
+    comp_prepare_eye_particles.param("AMBIENT_OCCLUSION_RADIUS", ambientOcclusionRadius);
+}
+
+function setambient_occlusion_samples(x){
+    ambientOcclusionSampleCount = Math.max(1, Math.min(16, Math.floor(x)));
+    comp_prepare_eye_particles.param("AMBIENT_OCCLUSION_SAMPLE_COUNT", ambientOcclusionSampleCount);
+}
+
+function setambient_light(){
+    if (arguments.length >= 3) {
+        ambientLight = [arguments[0], arguments[1], arguments[2]];
+    } else if (arguments.length == 1) {
+        ambientLight = [arguments[0], arguments[0], arguments[0]];
+    }
+    draw_particles.param("AMBIENT_LIGHT", ambientLight);
+}
+
+function setmotion_blur_strength(x){
+    motionBlurStrength = Math.max(0, Math.min(1, x));
+    draw_particles.param("MOTION_BLUR_STRENGTH", motionBlurStrength);
+}
+
+function setmotion_blur_max_stretch(x){
+    motionBlurMaxStretch = Math.max(0, x);
+    draw_particles.param("MOTION_BLUR_MAX_STRETCH", motionBlurMaxStretch);
+}
+
 
 // VECTOR MATH
 function normalizeVec3(v) {
@@ -246,30 +355,12 @@ function light_direction(){
     lightDir = normalizeVec3([arguments[0], arguments[1], arguments[2]]);
 }
 
-function compute_half_vector(){
-
-    // The paper's prose describes the branch as positive vs. negative dot product.
-    // Its pseudocode says > 1.0, but normalized vectors cannot exceed 1.0.
-
-    if(dot(viewDir, lightDir) > 0.0) {
-        halfVector = normalizeVec3(sumVec3(mulVec3Float(viewDir, -1.0), mulVec3Float(lightDir, +1.0)));
-        halfVector = mulVec3Float(halfVector, -1.0);
-        flipped = false;
-    } else {
-        halfVector = normalizeVec3(sumVec3(mulVec3Float(viewDir, -1.0), mulVec3Float(lightDir, +1.0)));
-
-        flipped = true;
-    }
-}
-
-
-
 function count(N) {
 
     particleCount = Math.max(0, Math.floor(N));
 
     const SIZE_OF_UINT = 4;
-    const PARTICLE_STRIDE_BYTES = 48;
+    const PARTICLE_STRIDE_BYTES = 64;
 
     const particleBytes = Math.max(1, particleCount) * PARTICLE_STRIDE_BYTES;
 
@@ -277,14 +368,15 @@ function count(N) {
 
     buff_particles.bytecount = particleBytes;
     buff_sorted_indices.bytecount = Math.max(1, particleCount) * SIZE_OF_UINT;
-    buff_particle_draw.bytecount = Math.max(1, particleCount) * 48;
+    buff_particle_draw.bytecount = Math.max(1, particleCount) * 64;
 
     buff_radix_histogram.bytecount = RADIX_BINS * SIZE_OF_UINT;
     buff_radix_cursor.bytecount = RADIX_BINS * SIZE_OF_UINT;
     buff_radix_bin_offsets.bytecount = RADIX_BINS * SIZE_OF_UINT;
     buff_radix_block_sums.bytecount = RADIX_BLOCK_COUNT * SIZE_OF_UINT;
     buff_radix_block_offsets.bytecount = RADIX_BLOCK_COUNT * SIZE_OF_UINT;
-    buff_sort_range.bytecount = 2 * SIZE_OF_UINT;
+    buff_sort_range.bytecount = 8 * SIZE_OF_UINT;
+    buff_light_slice_range.bytecount = 4 * 4; // vec4: lightMin, lightMax, invRange, unused
 
     comp_generate_position.param("COUNT", particleCount);
     comp_generate_position.param("SQRT_COUNT", Math.ceil(Math.sqrt(Math.max(1, particleCount))));
@@ -324,7 +416,9 @@ function calc_matrices() {
     farClip = proxy_camera.send("getfar_clip");
     nearClip = proxy_camera.send("getnear_clip");
     lensAngle = proxy_camera.send("getlens_angle");
-    viewDir = proxy_camera.send("getdirection");
+    // Use the look-at vector as the canonical camera-forward direction for
+    // front-to-back blending; this avoids depending on proxy-specific sign conventions.
+    viewDir = normalizeVec3(subVec3(at, pos));
 
     let up = [0, 1, 0];
 
@@ -359,6 +453,11 @@ function sort_particles(){
     comp_radix_scatter_particles.bang();
 }
 
+function compute_light_slice_range(){
+    comp_compute_light_slice_range.param("lightDir", lightDir);
+    comp_compute_light_slice_range.bang();
+}
+
 function clear_color_attachments(){
 
     comp_clear_color_target.bang();
@@ -370,17 +469,21 @@ function prepare_eye_particles(matrices) {
     comp_prepare_eye_particles.param("ligVP", matrices.ligVP);
     comp_prepare_eye_particles.param("lightDir", lightDir);
     comp_prepare_eye_particles.param("ALPHA", ALPHA);
+    comp_prepare_eye_particles.param("SHADOW_BLUR_SCALE", shadowBlurScale);
+    comp_prepare_eye_particles.param("AMBIENT_OCCLUSION_STRENGTH", ambientOcclusionStrength);
+    comp_prepare_eye_particles.param("AMBIENT_OCCLUSION_RADIUS", ambientOcclusionRadius);
+    comp_prepare_eye_particles.param("AMBIENT_OCCLUSION_SAMPLE_COUNT", ambientOcclusionSampleCount);
     comp_prepare_eye_particles.param("pc.COUNT", particleCount);
     comp_prepare_eye_particles.param("pc.SLICE_SIZE", sliceSize);
-    comp_prepare_eye_particles.param("pc.FLIPPED", flipped ? 1 : 0);
+    comp_prepare_eye_particles.param("opacityMultiplier", 10 * ALPHA / DENSITY_WORD_COUNT);
     comp_prepare_eye_particles.bang();
 }
 
 function prepare_shadow_particles(matrices) {
     comp_prepare_shadow_particles.param("VP", matrices.ligVP);
     comp_prepare_shadow_particles.param("ALPHA", ALPHA);
+    comp_prepare_shadow_particles.param("lightDir", lightDir);
     comp_prepare_shadow_particles.param("pc.COUNT", particleCount);
-    comp_prepare_shadow_particles.param("pc.FLIPPED", flipped ? 1 : 0);
     comp_prepare_shadow_particles.bang();
 }
 
@@ -388,21 +491,30 @@ function bang() {
 
     let transfrom = calc_matrices();
 
-    compute_half_vector();
-
-    comp_generate_position.param("TIME", TIME*0.1);
+    comp_generate_position.param("TIME", TIME * 0.1);
     comp_generate_position.param("SCALE", scale);
-    comp_generate_position.param("HALF_VECTOR", halfVector);
+    comp_generate_position.param("SORT_VECTOR", viewDir);
+    comp_generate_position.param("CAMERA_POS", pos);
     comp_generate_position.bang();
 
     sort_particles();
+    compute_light_slice_range();
 
     clear_color_attachments();
 
     prepare_shadow_particles(transfrom);
     comp_render_shadow.param("P", transfrom.ligP);
-    comp_render_shadow.param("FLIPPED", flipped ? 1 : 0);
     comp_render_shadow.bang();
+
+    // Build per-word cumulative bit counts after the shadow occupancy pass.
+    // The eye pass uses this prefix map to avoid scanning all previous words
+    // for every 9-tap shadow sample.
+    comp_build_density_prefix_counts.bang();
+
+    // Derive one closest-to-light blocker per logical shadow-map pixel. This
+    // lets the eye pass grow the shadow blur by distance travelled after the
+    // first occluder, rather than by absolute slice index.
+    comp_find_first_blocked_slice.bang();
 
     prepare_eye_particles(transfrom);
     draw_particles.param("V", transfrom.V);
@@ -410,11 +522,15 @@ function bang() {
     draw_particles.param("ligV", transfrom.ligV);
     draw_particles.param("ligP", transfrom.ligP);
     draw_particles.param("lightDir", lightDir);
+    draw_particles.param("MOTION_BLUR_STRENGTH", motionBlurStrength);
+    draw_particles.param("MOTION_BLUR_MAX_STRETCH", motionBlurMaxStretch);
+    draw_particles.param("ASPECT", RATIO);
+    draw_particles.param("AMBIENT_LIGHT", ambientLight);
     render_particles.jit_gpu_draw(draw_particles.name);
     render_particles.bang();
 
     //composite background
-    comp_composite_background.param("background", [0.2, 0.25, 0.4, 0.0]);
+    comp_composite_background.param("background", [ambientLight[0], ambientLight[1], ambientLight[2], 0.0]);
     comp_composite_background.bang();
 
     outlet(0, "source", img_color_target.name);
