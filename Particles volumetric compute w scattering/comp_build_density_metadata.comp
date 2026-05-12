@@ -13,7 +13,11 @@ layout(r32ui, binding = 0) uniform readonly uimage2D img_density_map;
 // etc.
 layout(r32ui, binding = 1) uniform writeonly uimage2D img_density_prefix_count_map;
 
-layout(binding = 2) uniform Cfg {
+// One uint per logical shadow pixel. Value is the closest-to-light occupied
+// slice index, or DENSITY_SLICE_COUNT if no slice is occupied at that pixel.
+layout(r32ui, binding = 2) uniform writeonly uimage2D img_first_blocked_slice_map;
+
+layout(binding = 3) uniform Cfg {
     uint DENSITY_WORD_COUNT;
     uint DENSITY_BITS_PER_WORD;
     uint DENSITY_SLICE_COUNT;
@@ -34,14 +38,28 @@ void main()
     if (logicalPixel.x >= logicalSize.x || logicalPixel.y >= logicalSize.y) return;
 
     uint prefix = 0u;
+    uint firstSlice = DENSITY_SLICE_COUNT;
+    bool firstSliceFound = false;
 
+    // One traversal over the density words builds both metadata products:
+    //  1. cumulative bit-count prefix for fast eye-pass blocker counting;
+    //  2. closest-to-light occupied slice for blur-radius estimation.
     for (uint word = 0u; word < DENSITY_WORD_COUNT; ++word) {
         ivec2 tiledPixel = densityPixelCoord(logicalPixel, word, logicalSize);
+        uint bits = imageLoad(img_density_map, tiledPixel).x;
 
         // Store count of all occupied slices before this 32-bit word.
         imageStore(img_density_prefix_count_map, tiledPixel, uvec4(prefix, 0u, 0u, 0u));
 
-        uint bits = imageLoad(img_density_map, tiledPixel).x;
+        if (!firstSliceFound && bits != 0u) {
+            // Bit 0 is the closest-to-light slice in a word.
+            uint bit = uint(findLSB(bits));
+            firstSlice = word * DENSITY_BITS_PER_WORD + bit;
+            firstSliceFound = true;
+        }
+
         prefix += bitCount(bits);
     }
+
+    imageStore(img_first_blocked_slice_map, logicalPixel, uvec4(firstSlice, 0u, 0u, 0u));
 }

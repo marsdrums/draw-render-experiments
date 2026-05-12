@@ -163,7 +163,7 @@
                     "numoutlets": 1,
                     "outlettype": [ "" ],
                     "patching_rect": [ 1125.0, 47.0, 80.0, 22.0 ],
-                    "text": "loadmess 0.1"
+                    "text": "loadmess 0.4"
                 }
             },
             {
@@ -366,8 +366,8 @@
                     "numinlets": 1,
                     "numoutlets": 1,
                     "outlettype": [ "" ],
-                    "patching_rect": [ 824.0, 47.0, 70.0, 22.0 ],
-                    "text": "loadmess 1"
+                    "patching_rect": [ 824.0, 47.0, 80.0, 22.0 ],
+                    "text": "loadmess 0.5"
                 }
             },
             {
@@ -745,8 +745,8 @@
                     "numinlets": 1,
                     "numoutlets": 2,
                     "outlettype": [ "", "" ],
-                    "patching_rect": [ 510.0, 372.0, 111.0, 22.0 ],
-                    "text": "jit.time @speed 0.1"
+                    "patching_rect": [ 510.0, 372.0, 118.0, 22.0 ],
+                    "text": "jit.time @speed 0.25"
                 }
             },
             {

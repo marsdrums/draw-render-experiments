@@ -2,32 +2,40 @@
 
 layout(local_size_x = 256) in;
 
-struct DrawParticle{
-    vec4 clipCenter;
-    vec4 prevClipCenter;
-    vec4 lightClipCenter;
-    // x = radius, y = center shadow/light, z = inside flag, w = light-space AABB slice index
-    vec4 data;
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+    vec2    _pad0;
+    vec3    prevPos;
+    float   _pad1;
 };
 
-layout(std430, set = 0, binding = 0) readonly buffer buff_particle_draw {
-    DrawParticle drawParticles[];
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
 };
 
-// 256-slice density map stored in one large 2D image:
-//   image width = shadowMapWidth * 8
-//   image height = shadowMapHeight
-//   tile 0: slices    0..31
-//   tile 1: slices   32..63
-//   tile 2: slices   64..95
-//   tile 3: slices   96..127
-//   tile 4: slices  128..159
-//   tile 5: slices  160..191
-//   tile 6: slices  192..223
-//   tile 7: slices  224..255
-layout(r32ui, binding = 1) uniform uimage2D img_density_map;
+// Sorted draw order. Values are indices into buff_particles.
+layout(std430, set = 0, binding = 1) readonly buffer buff_sorted_indices {
+    uint sortedIndices[];
+};
 
-layout(binding = 2) uniform Cfg{
+// x = lightMin, y = lightMax, z = invRange, w = unused.
+layout(std430, set = 0, binding = 2) readonly buffer buff_light_slice_range {
+    vec4 lightSliceRange;
+};
+
+// Packed light-space slice occupancy map. Width is tiled by 32-bit words:
+//   image width = logicalShadowWidth * DENSITY_WORD_COUNT
+//   image height = logicalShadowHeight
+// Each 32-bit word stores one 32-slice interval.
+layout(r32ui, binding = 3) uniform uimage2D img_density_map;
+
+// Keep the existing shadow-raster parameters together. P is the light
+// projection matrix used to estimate the screen-space particle footprint.
+layout(binding = 4) uniform Cfg{
     uint COUNT;
     uint SLICE_SIZE;
     float ALPHA;
@@ -37,35 +45,68 @@ layout(binding = 2) uniform Cfg{
     uint DENSITY_SLICE_COUNT;
 };
 
+// Values that previously lived in comp_prepare_shadow_particles.comp.
+// The merged pass now computes the light clip center and slice directly.
+layout(binding = 5) uniform ShadowPrepareConstants {
+    mat4 ligVP;
+    vec3 lightDir;
+};
+
+shared ivec2 logicalSize;
+shared vec2 fsize;
+
 ivec2 densityPixelCoord(ivec2 logicalPixel, uint wordIndex, ivec2 logicalSize)
 {
     return ivec2(logicalPixel.x + int(wordIndex) * logicalSize.x, logicalPixel.y);
 }
 
-void main() {
+uint lightSliceForPosition(vec3 pos)
+{
+    float lightMin = lightSliceRange.x;
+    float invRange = lightSliceRange.z;
+    float t = clamp((dot(lightDir, pos) - lightMin) * invRange, 0.0, 1.0);
+    return min(DENSITY_SLICE_COUNT - 1u,
+               uint(t * float(DENSITY_SLICE_COUNT - 1u) + 0.5));
+}
 
+void main()
+{
     uint gid = gl_GlobalInvocationID.x;
-    if(gid >= COUNT) return;
 
-    ivec2 fullSize = imageSize(img_density_map);
-    ivec2 logicalSize = ivec2(fullSize.x / int(DENSITY_WORD_COUNT), fullSize.y);
-    vec2 fsize = vec2(logicalSize);
+    if (gl_LocalInvocationIndex == 0u) {
+        ivec2 fullSize = imageSize(img_density_map);
+        logicalSize = ivec2(fullSize.x / int(DENSITY_WORD_COUNT), fullSize.y);
+        fsize = vec2(logicalSize);
+    }
+    barrier();
 
-    DrawParticle p = drawParticles[gid];
+    if (gid >= COUNT) return;
 
-    uint slice = min(DENSITY_SLICE_COUNT - 1u, uint(round(p.data.w)));
-    uint wordIndex = slice / DENSITY_BITS_PER_WORD;   // 0..7
-    uint bitIndex  = slice & 31u;                     // 0..31
+    // The former prepare-shadow pass did exactly these three operations:
+    //   1. fetch the sorted particle;
+    //   2. project it into light clip space;
+    //   3. compute its light-space slice.
+    // Doing them here avoids writing and then immediately rereading a temporary
+    // DrawParticle record that was only needed by this pass.
+    uint particleIndex = sortedIndices[gid];
+    Particle particle = particles[particleIndex];
+
+    vec4 clipCenter = ligVP * vec4(particle.pos, 1.0);
+    uint slice = lightSliceForPosition(particle.pos);
+
+    uint wordIndex = slice / DENSITY_BITS_PER_WORD;
+    uint bitIndex  = slice & 31u;
     uint value = 1u << bitIndex;
 
-    //since i'm not using transparency in shadow rendering, i make the particle slightly 
-    //smaller to account for the feathered edges, also speeding up the rendering
-    float rad = p.data.x; 
+    // Since the shadow representation is binary occupancy rather than a soft
+    // alpha footprint, the particle radius is used directly to define its
+    // projected light-space coverage rectangle, just as before.
+    float rad = particle.rad;
     vec4 a = P[0] * rad;
     vec4 b = P[1] * rad;
 
-    vec4 pos00 = p.clipCenter + (-a + -b);
-    vec4 pos11 = p.clipCenter + ( a +  b);
+    vec4 pos00 = clipCenter + (-a + -b);
+    vec4 pos11 = clipCenter + ( a +  b);
 
     vec2 uv00 = pos00.xy / pos00.w;
     vec2 uv11 = pos11.xy / pos11.w;
@@ -84,11 +125,11 @@ void main() {
     int x1 = min(logicalSize.x, int(ceil(pmax.x)));
     int y1 = min(logicalSize.y, int(ceil(pmax.y)));
 
-    for(int x = x0; x < x1; x++){
-    for(int y = y0; y < y1; y++){
-        ivec2 logicalPixel = ivec2(x, y);
-        ivec2 tiledPixel = densityPixelCoord(logicalPixel, wordIndex, logicalSize);
-        imageAtomicOr(img_density_map, tiledPixel, value);
-    }
+    for (int x = x0; x < x1; ++x) {
+        for (int y = y0; y < y1; ++y) {
+            ivec2 logicalPixel = ivec2(x, y);
+            ivec2 tiledPixel = densityPixelCoord(logicalPixel, wordIndex, logicalSize);
+            imageAtomicOr(img_density_map, tiledPixel, value);
+        }
     }
 }

@@ -17,10 +17,17 @@ struct Particle{
 
 struct DrawParticle{
     vec4 clipCenter;
-    vec4 prevClipCenter;
-    vec4 lightClipCenter;
-    // x = radius, y = center shadow/light, z = inside flag, w = ambient visibility
+    // Eye path: xyz = precomputed shaded particle color, w = inside/visible flag.
+    // Shadow path reuses this slot differently before the draw buffer is rewritten.
     vec4 data;
+    // x/y = motion-blur capsule center in aspect-corrected NDC metric space,
+    // z/w = unit motion axis in that same metric space.
+    vec4 motionData0;
+    // x = radius in aspect-corrected NDC metric space,
+    // y = along-axis quad extent,
+    // z = capsule half-length in particle-radius units,
+    // w = energy-conserving alpha compensation.
+    vec4 motionData1;
 };
 
 layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
@@ -55,8 +62,12 @@ layout(std430, set = 0, binding = 4) readonly buffer buff_light_slice_range {
 layout(set = 0, binding = 5) uniform Constants {
     mat4 VP;
     mat4 ligVP;
+    mat4 P;
     vec3 lightDir;
     float ALPHA;
+    float MOTION_BLUR_STRENGTH;
+    float MOTION_BLUR_MAX_STRETCH;
+    float ASPECT;
     uint DENSITY_WORD_COUNT;
     uint DENSITY_BITS_PER_WORD;
     uint DENSITY_SLICE_COUNT;
@@ -65,6 +76,7 @@ layout(set = 0, binding = 5) uniform Constants {
     float AMBIENT_OCCLUSION_STRENGTH;
     float AMBIENT_OCCLUSION_RADIUS;
     uint AMBIENT_OCCLUSION_SAMPLE_COUNT;
+    vec3 AMBIENT_LIGHT;
 };
 
 layout(binding = 6) uniform Cfg {
@@ -158,6 +170,55 @@ vec3 clipToTex(vec4 clipPos)
     projCoords.xy = projCoords.xy * 0.5 + 0.5;
     projCoords.y = 1.0 - projCoords.y;
     return projCoords;
+}
+
+void computeMotionBlurData(inout DrawParticle d, vec4 prevClipCenter, float particleRadius)
+{
+    float currentW = max(abs(d.clipCenter.w), 1e-6);
+    vec2 currentNdc = d.clipCenter.xy / currentW;
+
+    bool validPrev = abs(prevClipCenter.w) > 1e-6;
+    vec2 previousNdc = validPrev ? (prevClipCenter.xy / prevClipCenter.w) : currentNdc;
+
+    // Work in aspect-corrected NDC metric space. In this space, one unit in x
+    // and y corresponds to the same screen/pixel distance.
+    vec2 metricScale = vec2(max(ASPECT, 1e-6), 1.0);
+    vec2 currentMetric = currentNdc * metricScale;
+    vec2 previousMetric = mix(currentMetric,
+                              previousNdc * metricScale,
+                              clamp(MOTION_BLUR_STRENGTH, 0.0, 1.0));
+
+    vec2 motion = currentMetric - previousMetric;
+    float motionLength = length(motion);
+
+    vec2 axis = (motionLength > 1e-7) ? (motion / motionLength) : vec2(1.0, 0.0);
+
+    // Radius in the same aspect-corrected NDC metric. P[1].y is the vertical
+    // projection scale, so radiusMetric is the current screen-space particle radius.
+    float radiusMetric = max(abs(P[1].y) * particleRadius / currentW, 1e-7);
+
+    float halfLength = 0.5 * motionLength;
+    float maxHalfLength = max(MOTION_BLUR_MAX_STRETCH, 0.0) * radiusMetric;
+    halfLength = min(halfLength, maxHalfLength);
+
+    // The segment runs from the current position toward the previous position.
+    // When unclamped, this exactly spans the two projected particle centers.
+    vec2 centerMetric = currentMetric - axis * halfLength;
+
+    float halfLengthInRadii = halfLength / radiusMetric;
+    float alongExtent = halfLength + radiusMetric;
+
+    // Keep the integrated emitted radiance stable as the particle is stretched.
+    // The capsule uses alpha = (1 - r^2)^2, so the compensation follows the
+    // integrated-alpha growth of that footprint rather than hard geometric area.
+    float integratedAlphaStretch = 1.0 + (32.0 * halfLengthInRadii) / (5.0 * PI);
+    float alphaCompensation = 1.0 / max(integratedAlphaStretch, 1e-6);
+
+    d.motionData0 = vec4(centerMetric, axis);
+    d.motionData1 = vec4(radiusMetric,
+                         alongExtent,
+                         halfLengthInRadii,
+                         alphaCompensation);
 }
 
 bool lightProjectedPositionToDensityLookup(vec3 worldPos, out ivec2 logicalPixel, out uint slice)
@@ -280,16 +341,10 @@ void main()
 
     DrawParticle d;
     d.clipCenter = VP * vec4(p.pos, 1.0);
-    d.prevClipCenter = VP * vec4(p.prevPos, 1.0);
-    d.lightClipCenter = ligVP * vec4(p.pos, 1.0);
+    vec4 prevClipCenter = VP * vec4(p.prevPos, 1.0);
+    vec4 lightClipCenter = ligVP * vec4(p.pos, 1.0);
 
-    // data.x = radius
-    // data.y = direct-light transmittance from the shadow map
-    // data.z = inside/visible flag
-    // data.w = ambient visibility / ambient occlusion factor
-    d.data = vec4(p.rad, 1.0, 0.0, 1.0);
-
-    vec3 uv = clipToTex(d.lightClipCenter);
+    vec3 uv = clipToTex(lightClipCenter);
 
     uint firstBlockedSlice = sampleFirstBlockedSlice(uv);
     uint sliceTravelAfterFirstBlocker = 0u;
@@ -302,23 +357,33 @@ void main()
 
     uint seed = particleIndex + 9999u;
 
-    d.data.y = 0.0;
+    float shadowDensity = 0.0;
 
     float numSamples = 4.0;
     for (int i = 0; i < int(numSamples); i++) {
-        d.data.y += sampleShadow(uv, slice, randomUnitVector2(seed) * eps);
+        shadowDensity += sampleShadow(uv, slice, randomUnitVector2(seed) * eps);
     }
 
-    d.data.y /= numSamples;
-    d.data.y = exp(-d.data.y * opacityMultiplier);
+    shadowDensity /= numSamples;
+    float directTransmittance = exp(-shadowDensity * opacityMultiplier);
 
     // New 3D ambient occlusion:
     // sample points inside a sphere around the particle, project each point into
     // the density map, compute that sample point's light-space slice, then test
     // whether that texel/slice is occupied.
-    d.data.w = sampleAmbientOcclusion(p.pos, seed);
+    float ambientVisibility = sampleAmbientOcclusion(p.pos, seed);
 
-    d.data.z = 1.0;
+    // Particle lighting is constant across the four quad vertices, so prepare it
+    // once here and store the final shaded color in the draw payload.
+    vec3 albedo = vec3(0.7);
+    vec3 directLightColor = vec3(4.0, 3.0, 2.0);
+    vec3 shadedColor = albedo * (directLightColor * directTransmittance
+                               + AMBIENT_LIGHT * ambientVisibility);
+    d.data = vec4(shadedColor, 1.0);
+
+    // Motion-blur geometry and alpha compensation are particle-wide values.
+    // Compute them once here instead of repeating the work for all four quad vertices.
+    computeMotionBlurData(d, prevClipCenter, p.rad);
 
     drawParticles[gid] = d;
 }
