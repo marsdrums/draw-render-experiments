@@ -17,9 +17,9 @@ let shadowBlurScale = 0.0002;
 let ambientOcclusionStrength = 4.0;
 let ambientOcclusionRadius = 0.05;
 let ambientOcclusionSampleCount = 8;
-let ambientLight = [0.2, 0.25, 0.4];
+//let ambientLight = [0.2, 0.25, 0.4];
 //let ambientLight = [0.8, 0.8, 0.8];
-//let ambientLight = [0.007, 0.007, 0.007];
+let ambientLight = [0.007, 0.007, 0.007];
 let motionBlurStrength = 1.0;
 let motionBlurMaxStretch = 32.0;
 let previousGeneratedTime = null;
@@ -302,17 +302,18 @@ function setambient_occlusion_radius(x){
 }
 
 function setambient_occlusion_samples(x){
-    ambientOcclusionSampleCount = Math.max(1, Math.min(16, Math.floor(x)));
+    ambientOcclusionSampleCount = Math.max(1, x);
     comp_prepare_eye_particles.param("AMBIENT_OCCLUSION_SAMPLE_COUNT", ambientOcclusionSampleCount);
 }
 
-function setambient_light(){
+function setambient(){
     if (arguments.length >= 3) {
-        ambientLight = [arguments[0], arguments[1], arguments[2]];
+        ambientLight = [arguments[0]*4*4, arguments[1]*4*3, arguments[2]*4*2];
     } else if (arguments.length == 1) {
-        ambientLight = [arguments[0], arguments[0], arguments[0]];
+        ambientLight = [arguments[0]*4*4, arguments[0]*4*3, arguments[0]*4*2];
     }
     comp_prepare_eye_particles.param("AMBIENT_LIGHT", ambientLight);
+    comp_composite_background.param("background", [ambientLight[0]*0.25/4, ambientLight[1]*0.25/3, ambientLight[2]*0.25/2, 0.0]);
 }
 
 function setmotion_blur_strength(x){
@@ -409,7 +410,7 @@ function calc_matrices() {
 
     let up = [0, 1, 0];
 
-    let lightPos = new Float32Array([-lightDir[0] * 3, -lightDir[1] * 3, -lightDir[2] * 3]);
+    let lightPos = new Float32Array([-lightDir[0] * 3.5, -lightDir[1] * 3.5, -lightDir[2] * 3.5]);
 
 
     let matrices = {
@@ -467,7 +468,7 @@ function prepare_eye_particles(matrices) {
     comp_prepare_eye_particles.param("AMBIENT_LIGHT", ambientLight);
     comp_prepare_eye_particles.param("pc.COUNT", particleCount);
     comp_prepare_eye_particles.param("pc.SLICE_SIZE", sliceSize);
-    comp_prepare_eye_particles.param("opacityMultiplier", 10 * ALPHA / DENSITY_WORD_COUNT);
+    comp_prepare_eye_particles.param("opacityMultiplier", 20 * ALPHA / DENSITY_WORD_COUNT);
     comp_prepare_eye_particles.bang();
 }
 
@@ -497,7 +498,6 @@ function bang() {
     comp_build_density_metadata.bang();
 
     prepare_eye_particles(transfrom);
-    draw_particles.param("INV_ASPECT", 1.0 / Math.max(RATIO, 1e-6));
     render_particles.jit_gpu_draw(draw_particles.name);
     render_particles.bang();
 

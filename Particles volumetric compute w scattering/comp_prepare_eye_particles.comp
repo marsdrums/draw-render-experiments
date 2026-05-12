@@ -376,7 +376,7 @@ void main()
     // Particle lighting is constant across the four quad vertices, so prepare it
     // once here and store the final shaded color in the draw payload.
     vec3 albedo = vec3(0.7);
-    vec3 directLightColor = vec3(4.0, 3.0, 2.0);
+    vec3 directLightColor = vec3(4.0, 3.0, 2.0)*2;
     vec3 shadedColor = albedo * (directLightColor * directTransmittance
                                + AMBIENT_LIGHT * ambientVisibility);
     d.data = vec4(shadedColor, 1.0);
