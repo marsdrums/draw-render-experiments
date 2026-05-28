@@ -30,7 +30,7 @@ layout(std430, set = 0, binding = 3) buffer buff_radix_cursor {
     uint cursor[];
 };
 
-// sortRange[0..1] = ordered-float min/max camera sort key; sortRange[2..7] stores the particle AABB.
+// sortRange[0..1] = ordered-float min/max camera sort key.
 layout(std430, set = 0, binding = 4) readonly buffer buff_sort_range {
     uint sortRange[];
 };

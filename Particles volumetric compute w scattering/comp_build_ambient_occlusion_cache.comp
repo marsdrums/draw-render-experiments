@@ -1,0 +1,225 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "c74.noise.funcs.glsl"
+
+#define NUM_DIR 16
+
+layout(local_size_x = 256) in;
+
+// Decoded particle AABB, computed once per frame by comp_compute_light_slice_range.comp.
+layout(std430, set = 0, binding = 0) readonly buffer buff_particle_aabb {
+    vec4 particleAabbMin;
+    vec4 particleAabbMax;
+};
+
+// x = lightMin, y = lightMax, z = invRange, w = unused.
+layout(std430, set = 0, binding = 1) readonly buffer buff_light_slice_range {
+    vec4 lightSliceRange;
+};
+
+// Slice occupancy map. Width is tiled by 32-bit words; each bit is one light-space slice.
+layout(r32ui, binding = 2) uniform uimage2D img_density_map;
+
+// One RGB raw irradiance / ambient-visibility value per cubic AO probe for the current frame.
+layout(rgba32f, binding = 3) uniform writeonly image3D img_ambient_occlusion_cache_raw;
+
+layout(binding = 4) uniform sampler2D img_env;
+
+// GPU-fitted light projection matrices, generated once per frame from the reduced AABB.
+layout(std430, set = 0, binding = 5) readonly buffer buff_light_matrices {
+    mat4 lightP;
+    mat4 lightVP;
+};
+
+layout(set = 0, binding = 6) uniform Constants {
+    vec3 lightDir;
+    float AMBIENT_OCCLUSION_STRENGTH;
+    float AMBIENT_OCCLUSION_RADIUS;
+    uint AMBIENT_OCCLUSION_CACHE_RESOLUTION;
+    uint AMBIENT_OCCLUSION_CACHE_SAMPLE_COUNT;
+    uint DENSITY_WORD_COUNT;
+    uint DENSITY_BITS_PER_WORD;
+    uint DENSITY_SLICE_COUNT;
+    float ALPHA;
+    uint frame;
+};
+
+shared vec3 dir[gl_WorkGroupSize.x];
+shared vec2 uv[gl_WorkGroupSize.x];
+
+ivec2 densityPixelCoord(ivec2 logicalPixel, uint wordIndex, ivec2 logicalSize)
+{
+    return ivec2(logicalPixel.x + int(wordIndex) * logicalSize.x, logicalPixel.y);
+}
+
+uint loadDensityWord(ivec2 logicalPixel, uint wordIndex, ivec2 logicalSize)
+{
+    ivec2 tiledPixel = densityPixelCoord(logicalPixel, wordIndex, logicalSize);
+    return imageLoad(img_density_map, tiledPixel).x;
+}
+
+uint lightSliceForPosition(vec3 pos)
+{
+    float lightMin = lightSliceRange.x;
+    float invRange = lightSliceRange.z;
+    float t = clamp((dot(lightDir, pos) - lightMin) * invRange, 0.0, 1.0);
+    return min(DENSITY_SLICE_COUNT - 1u,
+               uint(t * float(DENSITY_SLICE_COUNT - 1u) + 0.5));
+}
+
+bool isDensitySliceOccupied(ivec2 logicalPixel, uint slice, ivec2 logicalSize)
+{
+    slice = min(slice, DENSITY_SLICE_COUNT - 1u);
+
+    uint wordIndex = slice / DENSITY_BITS_PER_WORD;
+    uint bitIndex  = slice & 31u;
+    uint wordBits  = loadDensityWord(logicalPixel, wordIndex, logicalSize);
+
+    return (wordBits & (1u << bitIndex)) != 0u;
+}
+
+float randomRadius01(inout uint seed)
+{
+    // Cubic-root distribution gives uniform volume sampling inside a sphere.
+    return pow(RandomFloat01(seed), 1.0 / 3.0);
+}
+
+vec3 clipToTex(vec4 clipPos)
+{
+    vec3 projCoords = clipPos.xyz / clipPos.w;
+    projCoords.xy = projCoords.xy * 0.5 + 0.5;
+    projCoords.y = 1.0 - projCoords.y;
+    return projCoords;
+}
+
+bool lightProjectedPositionToDensityLookup(vec3 worldPos, ivec2 logicalSize, out ivec2 logicalPixel, out uint slice)
+{
+    vec4 lightClip = lightVP * vec4(worldPos, 1.0);
+
+    if (abs(lightClip.w) < 1e-20) {
+        return false;
+    }
+
+    vec3 projCoords = clipToTex(lightClip);
+
+    if (projCoords.x < 0.0 || projCoords.x > 1.0 ||
+        projCoords.y < 0.0 || projCoords.y > 1.0 ||
+        projCoords.z > 1.0) {
+        return false;
+    }
+
+    vec2 fsize = vec2(logicalSize);
+    logicalPixel = ivec2(fsize * projCoords.xy);
+    logicalPixel = clamp(logicalPixel, ivec2(0), logicalSize - ivec2(1));
+
+    slice = lightSliceForPosition(worldPos);
+
+    return true;
+}
+
+
+bool pointInsideAabb(vec3 p, vec3 bmin, vec3 bmax)
+{
+    return all(greaterThanEqual(p, bmin)) && all(lessThanEqual(p, bmax));
+}
+
+vec3 computeAmbientVisibilityAtProbe(vec3 probeWorldPos, ivec2 logicalSize, vec3 bmin, vec3 bmax, uint basis)
+{
+
+    //float densitySum = 0.0;
+    //float weightSum = 0.0;
+    //float radius = AMBIENT_OCCLUSION_RADIUS;
+    float accum = 0.0;
+
+    float step = 0.3;
+    float dist = step;
+    vec3 res = vec3(0.0);
+    float samples = 0.0;
+
+    //vec3 perpDir[6];
+    //perpDir[0] =  dir[basis];
+    //perpDir[1] = -dir[basis];
+    //perpDir[2] = cross(perpDir[0], vec3(0,1,0));
+    //perpDir[3] = -perpDir[2];
+    //perpDir[4] = cross(perpDir[0], perpDir[2]);
+    //perpDir[5] = -perpDir[4];
+
+    for (uint i = 0u; i < NUM_DIR; ) {
+
+        uint id = (i + basis) % gl_WorkGroupSize.x;
+
+        //vec3 samplePos = probeWorldPos + dir[i] * AMBIENT_OCCLUSION_RADIUS * rad[i];
+        vec3 samplePos = probeWorldPos + dir[id] * AMBIENT_OCCLUSION_RADIUS * dist;
+        float val = accum * AMBIENT_OCCLUSION_STRENGTH * ALPHA * dist;
+        
+        if (!pointInsideAabb(samplePos, bmin, bmax) || val >= 4.0) {
+            i++;
+            res += vec3(exp(-val)) * texture(img_env, uv[id]).rgb;
+            accum = 0.0;
+            samples = 0.0;
+            dist = step;
+            continue;
+        }
+
+        ivec2 sampleLogicalPixel;
+        uint sampleSlice;
+        if (lightProjectedPositionToDensityLookup(samplePos, logicalSize, sampleLogicalPixel, sampleSlice)) {
+            accum += isDensitySliceOccupied(sampleLogicalPixel, sampleSlice, logicalSize) ? 1.0 : 0.0;
+            samples += 1.0;
+        }
+
+        dist += step;
+    }
+
+    return res / NUM_DIR;
+
+    //float avgOccupancy = densitySum / max(weightSum, 1e-6);
+    //return exp(-avgOccupancy * AMBIENT_OCCLUSION_STRENGTH);
+    //return exp(-accum * AMBIENT_OCCLUSION_STRENGTH * ALPHA);
+}
+
+void main()
+{
+    uint res = max(AMBIENT_OCCLUSION_CACHE_RESOLUTION, 1u);
+    uint probeCount = res * res * res;
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= probeCount) return;
+
+    uint lid = gl_LocalInvocationIndex;
+    uint seed = gid * 747796405u + 2891336453u + frame;
+
+    vec2 rand = RandomVec201(seed);
+    float dirz = rand.x * 2.0f - 1.0f;
+    float a = rand.y * TWOPI;
+    float r = sqrt(1.0f - dirz * dirz);
+    float dirx = r * cos(a);
+    float diry = r * sin(a);
+    uv[lid] = rand;
+    dir[lid] = vec3(dirx, diry, dirz);
+    barrier();
+
+    ivec2 fullDensitySize = imageSize(img_density_map);
+    ivec2 logicalSize = ivec2(fullDensitySize.x / int(DENSITY_WORD_COUNT), fullDensitySize.y);
+
+    vec3 bmin = particleAabbMin.xyz;
+    vec3 bmax = particleAabbMax.xyz;
+
+    uint layerSize = res * res;
+    uint z = gid / layerSize;
+    uint rem = gid - z * layerSize;
+    uint y = rem / res;
+    uint x = rem - y * res;
+
+    vec3 gridCoord;
+    if (res > 1u) {
+        float invResMinusOne = 1.0 / float(res - 1u);
+        gridCoord = vec3(float(x), float(y), float(z)) * invResMinusOne;
+    } else {
+        gridCoord = vec3(0.5);
+    }
+
+    vec3 probeWorldPos = mix(bmin, bmax, gridCoord);
+
+    vec3 indirect = computeAmbientVisibilityAtProbe(probeWorldPos, logicalSize, bmin, bmax, (gid) * NUM_DIR);
+    imageStore(img_ambient_occlusion_cache_raw, ivec3(int(x), int(y), int(z)), vec4(indirect, 1.0));
+}

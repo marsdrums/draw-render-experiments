@@ -89,14 +89,10 @@ void main()
     }
 
     float a = 1.0 - r2;
-    a *= a;
+    a = a*a*a;
+    //float a = 1.0 - sqrt(r2);
     a *= ALPHA;
     a *= alphaCompensation;
-
-    if(a < 0.00001){
-        discard;
-        return;
-    }
 
     fragColor = vec4(col * a, a); // pre-multiplied alpha
 }

@@ -33,22 +33,25 @@ layout(std430, set = 0, binding = 2) readonly buffer buff_light_slice_range {
 // Each 32-bit word stores one 32-slice interval.
 layout(r32ui, binding = 3) uniform uimage2D img_density_map;
 
-// Keep the existing shadow-raster parameters together. P is the light
-// projection matrix used to estimate the screen-space particle footprint.
+// Shadow-raster parameters.
 layout(binding = 4) uniform Cfg{
     uint COUNT;
     uint SLICE_SIZE;
     float ALPHA;
-    mat4 P;
     uint DENSITY_WORD_COUNT;
     uint DENSITY_BITS_PER_WORD;
     uint DENSITY_SLICE_COUNT;
 };
 
+// GPU-fitted light projection matrices, generated once per frame from the reduced AABB.
+layout(std430, set = 0, binding = 5) readonly buffer buff_light_matrices {
+    mat4 lightP;
+    mat4 lightVP;
+};
+
 // Values that previously lived in comp_prepare_shadow_particles.comp.
 // The merged pass now computes the light clip center and slice directly.
-layout(binding = 5) uniform ShadowPrepareConstants {
-    mat4 ligVP;
+layout(binding = 6) uniform ShadowPrepareConstants {
     vec3 lightDir;
 };
 
@@ -91,7 +94,7 @@ void main()
     uint particleIndex = sortedIndices[gid];
     Particle particle = particles[particleIndex];
 
-    vec4 clipCenter = ligVP * vec4(particle.pos, 1.0);
+    vec4 clipCenter = lightVP * vec4(particle.pos, 1.0);
     uint slice = lightSliceForPosition(particle.pos);
 
     uint wordIndex = slice / DENSITY_BITS_PER_WORD;
@@ -102,8 +105,8 @@ void main()
     // alpha footprint, the particle radius is used directly to define its
     // projected light-space coverage rectangle, just as before.
     float rad = particle.rad;
-    vec4 a = P[0] * rad;
-    vec4 b = P[1] * rad;
+    vec4 a = lightP[0] * rad;
+    vec4 b = lightP[1] * rad;
 
     vec4 pos00 = clipCenter + (-a + -b);
     vec4 pos11 = clipCenter + ( a +  b);

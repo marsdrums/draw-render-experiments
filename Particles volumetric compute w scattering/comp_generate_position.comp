@@ -33,22 +33,22 @@ layout(binding = 1) uniform Cfg {
 vec3 particlePositionAtTime(uint gid, float t)
 {
     vec3 seed;
-    seed.x = float(gid % SQRT_COUNT) * SCALE + t;
-    seed.y = float(gid / SQRT_COUNT) * SCALE + t;
-    seed.z = TIME*0.1;
+    seed.x = float(gid % SQRT_COUNT) * SCALE;
+    seed.y = float(gid / SQRT_COUNT) * SCALE;
+    seed.z = TIME;
 
     vec3 pos;
-    pos.x = Normalize(fBmA(seed                  ,  0.9, 2.0, 1., 12.));
-    pos.y = Normalize(fBmA(seed + vec3(1,2,3)*100,  0.9, 2.0, 1., 12.));
-    pos.z = Normalize(fBmA(seed + vec3(1,2,3)*200,  0.9, 2.0, 1., 12.));
+    pos.x = fBmA(seed                  ,  0.9, 2.0, 1., 6.);
+    pos.y = fBmA(seed + vec3(1,2,3)*100,  0.9, 2.0, 1., 6.);
+    pos.z = fBmA(seed + vec3(1,2,3)*200,  0.9, 2.0, 1., 6.);
 
-    pos = 0.5*(pos * 2.0 - 1.0);
+    pos *= 0.5;
 
     // Keep the static per-particle jitter identical for current and previous
     // positions so motion blur only represents actual procedural motion.
     uint jittSeed = gid + 999u;
     vec3 jittering = (RandomVec301(jittSeed) - 0.5) * 0.005;
-    return pos;// + jittering;
+    return pos + jittering;
 }
 
 void main() {
@@ -62,7 +62,8 @@ void main() {
     p.pos = particlePositionAtTime(gid, TIME);
 
     p.rad = RADIUS;
-    p.col = vec4(sin(float(gid) * vec3(1,2,3))*0.5 + 0.5,1);
+    uint seed = gid*99u + 777u;
+    p.col = vec4(RandomVec301(seed)*0.7, 1.0);
     p.id = gid;
     p._pad0 = vec2(0.0);
     p._pad1 = 0.0;

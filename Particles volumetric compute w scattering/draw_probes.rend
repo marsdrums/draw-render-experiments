@@ -1,0 +1,48 @@
+#version 460
+
+#pragma stage(vertex)
+
+// Decoded particle AABB, shared by all later passes that need world-space bounds.
+layout(std430, set = 0, binding = 0) readonly buffer buff_particle_aabb {
+    vec4 particleAabbMin;
+    vec4 particleAabbMax;
+};
+
+layout(binding = 1) uniform Cfg{
+    mat4 V;
+    mat4 P;
+    uint res;
+};
+
+layout(location = 0) in vec4 offset;
+
+layout(location = 0) out vec3 col;
+
+void main()
+{
+    
+    uint x = gl_InstanceIndex % res;
+    uint y = (gl_InstanceIndex % (res*res)) / res;
+    uint z = gl_InstanceIndex / (res*res);
+
+    vec3 probePos = mix(particleAabbMin.xyz, particleAabbMax.xyz, vec3(x, y, z) / float(res - 1u));
+
+    vec4 vProbePos = V * vec4(probePos, 1.0);
+    float radius = 0.004;
+
+    gl_Position = P * vec4(vProbePos.xy + offset.xy*radius, vProbePos.zw);
+    col = vec3(1,0,0);
+}
+
+#pragma stage(fragment)
+
+layout(location = 0) in vec3 col;
+
+layout(location = 0) out vec4 fragColor;
+
+
+void main()
+{
+
+    fragColor = vec4(col, 0.3); // pre-multiplied alpha
+}

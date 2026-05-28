@@ -1,0 +1,76 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+struct AabbRecord {
+    vec4 bmin;
+    vec4 bmax;
+};
+
+// Fixed ping-pong buffers. READ_FROM_A selects the input buffer; output goes to the other one.
+layout(std430, set = 0, binding = 0) buffer buff_aabb_reduce_a {
+    AabbRecord aabbReduceA[];
+};
+
+layout(std430, set = 0, binding = 1) buffer buff_aabb_reduce_b {
+    AabbRecord aabbReduceB[];
+};
+
+layout(binding = 2) uniform Cfg {
+    uint COUNT;
+    uint READ_FROM_A;
+};
+
+shared vec4 sharedMin[gl_WorkGroupSize.x];
+shared vec4 sharedMax[gl_WorkGroupSize.x];
+
+AabbRecord loadAabbRecord(uint index)
+{
+    if (READ_FROM_A != 0u) {
+        return aabbReduceA[index];
+    }
+    return aabbReduceB[index];
+}
+
+void storeAabbRecord(uint index, AabbRecord record)
+{
+    if (READ_FROM_A != 0u) {
+        aabbReduceB[index] = record;
+    } else {
+        aabbReduceA[index] = record;
+    }
+}
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationIndex;
+
+    vec3 localMin = vec3( 3.402823466e+38);
+    vec3 localMax = vec3(-3.402823466e+38);
+
+    if (gid < COUNT) {
+        AabbRecord inputRecord = loadAabbRecord(gid);
+        localMin = inputRecord.bmin.xyz;
+        localMax = inputRecord.bmax.xyz;
+    }
+
+    sharedMin[lid] = vec4(localMin, 0.0);
+    sharedMax[lid] = vec4(localMax, 0.0);
+    barrier();
+
+    for (uint stride = gl_WorkGroupSize.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            sharedMin[lid].xyz = min(sharedMin[lid].xyz, sharedMin[lid + stride].xyz);
+            sharedMax[lid].xyz = max(sharedMax[lid].xyz, sharedMax[lid + stride].xyz);
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        AabbRecord outRecord;
+        outRecord.bmin = vec4(sharedMin[0].xyz, 0.0);
+        outRecord.bmax = vec4(sharedMax[0].xyz, 0.0);
+        storeAabbRecord(gl_WorkGroupID.x, outRecord);
+    }
+}

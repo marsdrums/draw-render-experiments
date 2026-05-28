@@ -18,8 +18,7 @@ layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
 };
 
 // sortRange[0..1] = ordered-float min/max camera sort key.
-// sortRange[2..4] = ordered-float AABB min xyz.
-// sortRange[5..7] = ordered-float AABB max xyz.
+// Particle AABB reduction is performed separately by comp_reduce_particle_aabb_*.comp.
 layout(std430, set = 0, binding = 1) buffer buff_sort_range {
     uint sortRange[];
 };
@@ -43,14 +42,4 @@ void main() {
     atomicMin(sortRange[0], orderedKey);
     atomicMax(sortRange[1], orderedKey);
 
-    uint ox = float_to_ordered_uint(p.pos.x);
-    uint oy = float_to_ordered_uint(p.pos.y);
-    uint oz = float_to_ordered_uint(p.pos.z);
-
-    atomicMin(sortRange[2], ox);
-    atomicMin(sortRange[3], oy);
-    atomicMin(sortRange[4], oz);
-    atomicMax(sortRange[5], ox);
-    atomicMax(sortRange[6], oy);
-    atomicMax(sortRange[7], oz);
 }

@@ -1,12 +1,46 @@
 #version 460
+#define PI 3.141592653589793238462643383279502884197
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(rgba32f, binding = 0) uniform image2D img_color_target;
+layout(binding = 1) uniform sampler2D img_env;
 
-layout(binding = 1) uniform Cfg{
+layout(binding = 2) uniform Cfg{
     vec4 background;
+    // xy = projected directional-light position in background UV space,
+    // z  = 1 when the light direction is in front of the camera, 0 otherwise,
+    // w  = unused.
+    vec4 flareCenterVisibility;
+    // rgb = same light color used by particle direct lighting,
+    // w   = flare strength.
+    vec4 flareColorStrength;
+    // x = core radius in UV units,
+    // y = halo radius in UV units,
+    // z = viewport aspect ratio,
+    // w = halo strength relative to the core.
+    vec4 flareShape;
+
+    // xyz = world-space camera forward direction,
+    // w   = tan(verticalFov * 0.5).
+    vec4 cameraForwardTanHalfFov;
+
+    // xyz = world-space camera right direction,
+    // w   = viewport aspect ratio.
+    vec4 cameraRightAspect;
+
+    // xyz = world-space camera up direction,
+    // w   = unused.
+    vec4 cameraUp;
 };
+
+vec2 dir2uv(vec3 v)
+{
+    vec2 uv = vec2(atan(v.z, v.x), asin(v.y));
+    uv *= vec2(1/(2*PI), -1/PI); //to invert atan
+    uv += 0.5;
+    return uv;
+}
 
 void main() {
 
@@ -17,6 +51,34 @@ void main() {
 
     vec4 col = imageLoad(img_color_target, gid);
 
-    vec3 finalRgb = col.rgb + background.rgb * (1.0 - col.a);
+    vec2 uv = (vec2(gid) + vec2(0.5)) / vec2(max(size, ivec2(1)));
+
+    // Reconstruct a world-space view ray for this background pixel.
+    // Shader/image UV has y downward, while projection-space NDC has y upward.
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    float tanHalfFov = max(cameraForwardTanHalfFov.w, 1e-6);
+    float aspect = max(cameraRightAspect.w, 1e-6);
+    vec3 viewRay = normalize(cameraForwardTanHalfFov.xyz
+                           + cameraRightAspect.xyz * (ndc.x * aspect * tanHalfFov)
+                           + cameraUp.xyz * (ndc.y * tanHalfFov));
+
+    vec3 env = texture(img_env, dir2uv(viewRay)).rgb;
+    vec2 flareDelta = uv - flareCenterVisibility.xy;
+    flareDelta.x *= max(flareShape.z, 1e-6);
+
+    float dist2 = dot(flareDelta, flareDelta);
+    float coreRadius = max(flareShape.x, 1e-6);
+    float haloRadius = max(flareShape.y, 1e-6);
+
+    float core = exp(-dist2 / (2.0 * coreRadius * coreRadius));
+    float halo = exp(-dist2 / (2.0 * haloRadius * haloRadius)) * max(flareShape.w, 0.0);
+
+    float flareAmount = flareCenterVisibility.z
+                      * max(flareColorStrength.w, 0.0)
+                      * (core + halo);
+
+    vec3 backgroundWithFlare = env + background.rgb + flareColorStrength.rgb * flareAmount;
+    vec3 finalRgb = col.rgb + backgroundWithFlare * (1.0 - col.a);
+
     imageStore(img_color_target, gid, vec4(finalRgb, 1.0));
 }

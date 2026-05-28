@@ -1,0 +1,74 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+struct Particle{
+    vec3    pos;
+    float   rad;
+    vec4    col;
+    float   key;
+    uint    id;
+    vec2    _pad0;
+    vec3    prevPos;
+    float   _pad1;
+};
+
+struct AabbRecord {
+    vec4 bmin;
+    vec4 bmax;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer buff_particles {
+    Particle particles[];
+};
+
+// First reduction level: one AabbRecord per workgroup.
+layout(std430, set = 0, binding = 1) writeonly buffer buff_aabb_reduce_a {
+    AabbRecord aabbReduceA[];
+};
+
+layout(binding = 2) uniform Cfg {
+    uint COUNT;
+};
+
+shared vec4 sharedMin[gl_WorkGroupSize.x];
+shared vec4 sharedMax[gl_WorkGroupSize.x];
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationIndex;
+
+    vec3 localMin = vec3( 3.402823466e+38);
+    vec3 localMax = vec3(-3.402823466e+38);
+
+    if (gid < COUNT) {
+        vec3 p = particles[gid].pos;
+        localMin = p;
+        localMax = p;
+    }
+
+    sharedMin[lid] = vec4(localMin, 0.0);
+    sharedMax[lid] = vec4(localMax, 0.0);
+    barrier();
+
+    for (uint stride = gl_WorkGroupSize.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            sharedMin[lid].xyz = min(sharedMin[lid].xyz, sharedMin[lid + stride].xyz);
+            sharedMax[lid].xyz = max(sharedMax[lid].xyz, sharedMax[lid + stride].xyz);
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        AabbRecord outRecord;
+        if (COUNT == 0u) {
+            outRecord.bmin = vec4(0.0);
+            outRecord.bmax = vec4(0.0);
+        } else {
+            outRecord.bmin = vec4(sharedMin[0].xyz, 0.0);
+            outRecord.bmax = vec4(sharedMax[0].xyz, 0.0);
+        }
+        aabbReduceA[gl_WorkGroupID.x] = outRecord;
+    }
+}

@@ -1,0 +1,141 @@
+#version 460
+
+layout(local_size_x = 256) in;
+
+// Raw current-frame irradiance / AO values produced by comp_build_ambient_occlusion_cache.comp.
+layout(rgba32f, binding = 0) uniform readonly image3D img_ambient_occlusion_cache_raw;
+
+// Double-depth filtered irradiance cache. The front half and back half
+// alternate between history and the current filtered output.
+layout(rgba32f, binding = 1) uniform writeonly image3D img_ambient_occlusion_cache;
+
+// Same filtered irradiance cache, sampled with hardware trilinear interpolation
+// when reprojecting previous-frame history into the current probe grid.
+layout(binding = 3) uniform sampler3D tex_ambient_occlusion_cache_history;
+
+// Current decoded particle AABB. Probe coordinates in the raw cache use this box.
+layout(std430, set = 0, binding = 4) readonly buffer buff_particle_aabb {
+    vec4 particleAabbMin;
+    vec4 particleAabbMax;
+};
+
+// Decoded particle AABB from the frame that produced the history cache half.
+layout(std430, set = 0, binding = 5) readonly buffer buff_previous_particle_aabb {
+    vec4 previousParticleAabbMin;
+    vec4 previousParticleAabbMax;
+};
+
+layout(set = 0, binding = 2) uniform Constants {
+    uint AMBIENT_OCCLUSION_CACHE_RESOLUTION;
+    float AMBIENT_OCCLUSION_CACHE_HISTORY_WEIGHT;
+    uint AMBIENT_OCCLUSION_CACHE_HISTORY_VALID;
+    uint AMBIENT_OCCLUSION_CACHE_READ_Z_OFFSET;
+    uint AMBIENT_OCCLUSION_CACHE_WRITE_Z_OFFSET;
+};
+
+uvec3 probeCoordFromIndex(uint gid, uint res)
+{
+    uint layerSize = res * res;
+    uint z = gid / layerSize;
+    uint rem = gid - z * layerSize;
+    uint y = rem / res;
+    uint x = rem - y * res;
+    return uvec3(x, y, z);
+}
+
+vec3 probeGridUVW(uvec3 coord, uint res)
+{
+    if (res <= 1u) {
+        return vec3(0.5);
+    }
+    return vec3(coord) / float(res - 1u);
+}
+
+vec3 probeWorldPosition(uvec3 coord, uint res)
+{
+    vec3 uvw = probeGridUVW(coord, res);
+    return mix(particleAabbMin.xyz, particleAabbMax.xyz, uvw);
+}
+
+bool worldPositionToPreviousCacheTexcoord(vec3 worldPos, uint res, out vec3 texCoord)
+{
+    vec3 prevMin = previousParticleAabbMin.xyz;
+    vec3 prevMax = previousParticleAabbMax.xyz;
+    vec3 prevExtent = prevMax - prevMin;
+
+    // Degenerate previous boxes do not provide a meaningful history volume.
+    if (any(lessThanEqual(abs(prevExtent), vec3(1e-8)))) {
+        texCoord = vec3(0.0);
+        return false;
+    }
+
+    vec3 prevUVW = (worldPos - prevMin) / prevExtent;
+    bool inside = all(greaterThanEqual(prevUVW, vec3(0.0))) &&
+                  all(lessThanEqual(prevUVW, vec3(1.0)));
+    if (!inside) {
+        texCoord = vec3(0.0);
+        return false;
+    }
+
+    // Convert local previous-frame cache coordinates to normalized texture coordinates.
+    // X/Y dimensions are res, Z dimension is 2*res because one 3D texture stores
+    // both ping-pong cache halves.
+    float resf = float(res);
+    float depthf = float(res * 2u);
+    vec3 localTexel = prevUVW * float(res - 1u) + vec3(0.5);
+    texCoord = vec3(localTexel.x / resf,
+                    localTexel.y / resf,
+                    (float(AMBIENT_OCCLUSION_CACHE_READ_Z_OFFSET) + localTexel.z) / depthf);
+    return true;
+}
+
+void currentNeighborhoodMinMax(uvec3 centerCoord, uint res, out vec3 minValue, out vec3 maxValue)
+{
+    minValue = vec3( 3.402823466e+38);
+    maxValue = vec3(-3.402823466e+38);
+
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec3 icoord = ivec3(centerCoord) + ivec3(dx, dy, dz);
+                icoord = clamp(icoord, ivec3(0), ivec3(int(res) - 1));
+                vec3 v = imageLoad(img_ambient_occlusion_cache_raw, icoord).rgb;
+                minValue = min(minValue, v);
+                maxValue = max(maxValue, v);
+            }
+        }
+    }
+}
+
+void main()
+{
+    uint res = max(AMBIENT_OCCLUSION_CACHE_RESOLUTION, 1u);
+    uint probeCount = res * res * res;
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= probeCount) return;
+
+    uvec3 coord = probeCoordFromIndex(gid, res);
+    ivec3 icoord = ivec3(coord);
+    vec3 currentValue = imageLoad(img_ambient_occlusion_cache_raw, icoord).rgb;
+    vec3 filteredValue = currentValue;
+
+    if (AMBIENT_OCCLUSION_CACHE_HISTORY_VALID != 0u) {
+        vec3 currentProbeWorldPos = probeWorldPosition(coord, res);
+        vec3 previousCacheTexCoord;
+        bool historyAvailable = worldPositionToPreviousCacheTexcoord(currentProbeWorldPos, res, previousCacheTexCoord);
+
+        if (historyAvailable) {
+            vec3 neighborhoodMin;
+            vec3 neighborhoodMax;
+            currentNeighborhoodMinMax(coord, res, neighborhoodMin, neighborhoodMax);
+
+            vec3 previousValue = texture(tex_ambient_occlusion_cache_history, previousCacheTexCoord).rgb;
+            vec3 clampedPreviousValue = clamp(previousValue, neighborhoodMin, neighborhoodMax);
+            filteredValue = mix(currentValue, clampedPreviousValue, vec3(clamp(AMBIENT_OCCLUSION_CACHE_HISTORY_WEIGHT, 0.0, 1.0)));
+        }
+    }
+
+    imageStore(img_ambient_occlusion_cache,
+               ivec3(icoord.xy, icoord.z + int(AMBIENT_OCCLUSION_CACHE_WRITE_Z_OFFSET)),
+               vec4(filteredValue, 1.0));
+}
